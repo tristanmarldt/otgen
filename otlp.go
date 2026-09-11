@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	mathrand "math/rand/v2"
@@ -167,6 +168,53 @@ func mergeAttrs(base, extra map[string]AttrValue) map[string]AttrValue {
 	return base
 }
 
+// hostID returns the MD5 hex digest of name, giving a stable 32-char host.id.
+func hostID(name string) string {
+	sum := md5.Sum([]byte(name))
+	return hex.EncodeToString(sum[:])
+}
+
+// effectiveHostName returns the user-supplied HostName when set, otherwise the
+// per-template placeholder for host-category infra templates.
+func effectiveHostName(svc Service) string {
+	if svc.HostName != "" {
+		return svc.HostName
+	}
+	switch svc.InfraTemplate {
+	case "host":
+		return "prod-server-01"
+	case "process":
+		return "localhost"
+	default:
+		return "otel-host-01"
+	}
+}
+
+// effectiveProcessName returns the user-supplied ProcessName when set, otherwise
+// svc.Name (the existing default for process.executable.name).
+func effectiveProcessName(svc Service) string {
+	if svc.ProcessName != "" {
+		return svc.ProcessName
+	}
+	return svc.Name
+}
+
+func otelHostAttrs(hostName string) map[string]AttrValue {
+	return map[string]AttrValue{
+		"host.id":             strAttrVal(hostID(hostName)),
+		"host.name":           strAttrVal(hostName),
+		"host.arch":           strAttrVal("amd64"),
+		"host.ip":             strAttrVal("192.168.1.100"),
+		"host.cpu.model.name": strAttrVal("Intel(R) Xeon(R) CPU @ 2.20GHz"),
+		"os.type":             strAttrVal("linux"),
+		"os.name":             strAttrVal("Ubuntu"),
+		"os.version":          strAttrVal("22.04"),
+		"os.description":      strAttrVal("Ubuntu 22.04.3 LTS"),
+		"os.build.id":         strAttrVal("22.04"),
+		"telemetry.sdk.name":  strAttrVal("opentelemetry"),
+	}
+}
+
 // infraDefaults returns resource attributes for the service's InfraTemplate.
 // Values are deterministic so resource attributes stay stable across ticks.
 // Users override specific values via svc.Attributes.
@@ -215,9 +263,10 @@ func infraDefaults(svc Service) map[string]AttrValue {
 		}
 
 	case "host":
+		hn := effectiveHostName(svc)
 		return map[string]AttrValue{
-			"host.name":  strAttrVal("prod-server-01"),
-			"host.id":    strAttrVal("i-0abcdef1234567890"),
+			"host.name":  strAttrVal(hn),
+			"host.id":    strAttrVal(hostID(hn)),
 			"host.type":  strAttrVal("m5.large"),
 			"host.arch":  strAttrVal("amd64"),
 			"os.type":    strAttrVal("linux"),
@@ -254,13 +303,29 @@ func infraDefaults(svc Service) map[string]AttrValue {
 		}
 
 	case "process":
+		hn := effectiveHostName(svc)
+		pn := effectiveProcessName(svc)
 		return map[string]AttrValue{
 			"process.pid":             intAttrVal(12345),
-			"process.executable.name": strAttrVal(name),
+			"process.executable.name": strAttrVal(pn),
+			"process.command_line":    strAttrVal("/usr/bin/" + pn + " --config=/etc/" + pn + ".yaml"),
 			"process.runtime.name":    strAttrVal("go"),
 			"process.runtime.version": strAttrVal("1.24.0"),
-			"host.name":               strAttrVal("localhost"),
+			"host.name":               strAttrVal(hn),
+			"host.id":                 strAttrVal(hostID(hn)),
 		}
+
+	case "otel-host":
+		return otelHostAttrs(effectiveHostName(svc))
+
+	case "otel-host-process":
+		hn := effectiveHostName(svc)
+		pn := effectiveProcessName(svc)
+		return mergeAttrs(otelHostAttrs(hn), map[string]AttrValue{
+			"process.executable.name": strAttrVal(pn),
+			"process.pid":             intAttrVal(12345),
+			"process.command_line":    strAttrVal("/usr/bin/" + pn + " --config=/etc/" + pn + ".yaml"),
+		})
 
 	case "openshift":
 		return mergeAttrs(k8sAttrs(name, "my-ocp-cluster", "ocp-worker-1"), map[string]AttrValue{
@@ -627,4 +692,151 @@ func boolAttr(key string, value bool) *commonpb.KeyValue {
 
 func doubleAttr(key string, value float64) *commonpb.KeyValue {
 	return &commonpb.KeyValue{Key: key, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_DoubleValue{DoubleValue: value}}}
+}
+
+// ── infra template metrics ────────────────────────────────────────────────────
+
+// hostMemoryBytes is the memory size modelled for synthetic OTel hosts, so that
+// system.memory.usage and system.memory.utilization agree with each other.
+const hostMemoryBytes int64 = 16 << 30
+
+// otgenStart stands in for host/process boot time. Cumulative sums need a start
+// timestamp; a fixed one per run is what a real SDK reports and keeps metric
+// generation a pure function of (svc, now).
+var otgenStart = time.Now()
+
+// infraMetrics returns the metrics an infra template must emit for Dynatrace
+// entity extraction, mirroring how infraDefaults supplies its attributes.
+//
+// The OpenTelemetry Host Monitoring extension routes on the metric KEY, not on
+// resource attributes alone: a system.* metric creates the otel:host entity and
+// a process.* metric creates otel:process. Without one, a resource carrying a
+// perfectly correct host.id / host.name / telemetry.sdk.name produces no entity
+// at all.
+//
+// Only gauges and non-monotonic cumulative sums are emitted. Delta monotonic
+// sums (system.cpu.time, system.network.io, …) would need StartTimeUnixNano
+// chained to the previous emission, and therefore per-service state that
+// buildEmissionPayloads deliberately does not carry.
+func infraMetrics(svc Service, now time.Time) []*metricspb.Metric {
+	switch svc.InfraTemplate {
+	case "otel-host":
+		return hostVitalMetrics(now)
+	case "otel-host-process":
+		return append(hostVitalMetrics(now), processVitalMetrics(now)...)
+	}
+	return nil
+}
+
+// infraMetricNames lists the metric keys infraMetrics emits for a template.
+// The UI needs the names to describe what a service sends; going through
+// infraMetrics for that would build throwaway protos and draw RNG samples on
+// every render. Kept adjacent to infraMetrics so the two stay in step —
+// TestInfraMetricNamesMatchInfraMetrics fails if they drift.
+func infraMetricNames(template string) []string {
+	switch template {
+	case "otel-host":
+		return []string{
+			"system.cpu.utilization", "system.cpu.load_average.1m",
+			"system.memory.utilization", "system.memory.usage",
+		}
+	case "otel-host-process":
+		return append(infraMetricNames("otel-host"),
+			"process.cpu.utilization", "process.memory.usage", "process.memory.virtual")
+	}
+	return nil
+}
+
+// istioMetricNames lists the metric keys istioMetrics emits, for the same reason.
+var istioMetricNames = []string{
+	"istio_requests_total", "istio_request_duration_milliseconds",
+	"istio_request_bytes", "istio_response_bytes",
+}
+
+// gaugeMetric builds a single-valued Gauge. Gauges carry neither aggregation
+// temporality nor a start timestamp.
+func gaugeMetric(name, unit string, now time.Time, points []*metricspb.NumberDataPoint) *metricspb.Metric {
+	return &metricspb.Metric{
+		Name: name, Unit: unit,
+		Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: points}},
+	}
+}
+
+// cumulativeSum builds a non-monotonic cumulative Sum — the shape the
+// hostmetrics receiver uses for "current size" metrics such as memory usage.
+// These survive the reference collector's cumulative_to_delta unchanged, which
+// only converts monotonic sums.
+func cumulativeSum(name, unit string, now time.Time, points []*metricspb.NumberDataPoint) *metricspb.Metric {
+	for _, dp := range points {
+		dp.StartTimeUnixNano = uint64(otgenStart.UnixNano())
+	}
+	return &metricspb.Metric{
+		Name: name, Unit: unit,
+		Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+			AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+			IsMonotonic:            false,
+			DataPoints:             points,
+		}},
+	}
+}
+
+func doublePoint(now time.Time, v float64, attrs ...*commonpb.KeyValue) *metricspb.NumberDataPoint {
+	return &metricspb.NumberDataPoint{
+		TimeUnixNano: uint64(now.UnixNano()), Attributes: attrs,
+		Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: v},
+	}
+}
+
+func intPoint(now time.Time, v int64, attrs ...*commonpb.KeyValue) *metricspb.NumberDataPoint {
+	return &metricspb.NumberDataPoint{
+		TimeUnixNano: uint64(now.UnixNano()), Attributes: attrs,
+		Value: &metricspb.NumberDataPoint_AsInt{AsInt: v},
+	}
+}
+
+// hostVitalMetrics returns the system.* metrics that create the otel:host
+// entity and populate the extension's headline host charts. Values are derived
+// from one draw so that usage and utilization stay consistent.
+func hostVitalMetrics(now time.Time) []*metricspb.Metric {
+	usedFraction := 0.25 + mathrand.Float64()*0.5
+	usedBytes := int64(float64(hostMemoryBytes) * usedFraction)
+	cpuUtilization := 0.05 + mathrand.Float64()*0.7
+
+	return []*metricspb.Metric{
+		// The reference pipeline filters out state=idle and averages across
+		// cores, leaving one attribute-less value — so emit exactly that.
+		gaugeMetric("system.cpu.utilization", "1", now, []*metricspb.NumberDataPoint{
+			doublePoint(now, cpuUtilization),
+		}),
+		gaugeMetric("system.cpu.load_average.1m", "{thread}", now, []*metricspb.NumberDataPoint{
+			doublePoint(now, cpuUtilization*8),
+		}),
+		gaugeMetric("system.memory.utilization", "1", now, []*metricspb.NumberDataPoint{
+			doublePoint(now, usedFraction, stringAttr("state", "used")),
+			doublePoint(now, 1-usedFraction, stringAttr("state", "free")),
+		}),
+		cumulativeSum("system.memory.usage", "By", now, []*metricspb.NumberDataPoint{
+			intPoint(now, usedBytes, stringAttr("state", "used")),
+			intPoint(now, hostMemoryBytes-usedBytes, stringAttr("state", "free")),
+		}),
+	}
+}
+
+// processVitalMetrics returns the process.* metrics that create the
+// otel:process entity. The process is identified by the resource's
+// process.executable.name, so these carry no identifying attributes of their own.
+func processVitalMetrics(now time.Time) []*metricspb.Metric {
+	residentBytes := int64(64<<20) + int64(mathrand.IntN(512<<20))
+	return []*metricspb.Metric{
+		gaugeMetric("process.cpu.utilization", "1", now, []*metricspb.NumberDataPoint{
+			doublePoint(now, 0.01+mathrand.Float64()*0.3),
+		}),
+		cumulativeSum("process.memory.usage", "By", now, []*metricspb.NumberDataPoint{
+			intPoint(now, residentBytes),
+		}),
+		// Virtual is reliably a multiple of resident, so the two charts track.
+		cumulativeSum("process.memory.virtual", "By", now, []*metricspb.NumberDataPoint{
+			intPoint(now, residentBytes*5/2),
+		}),
+	}
 }

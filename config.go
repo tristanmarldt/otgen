@@ -92,7 +92,7 @@ func doubleAttrVal(v float64) AttrValue { return AttrValue{Type: "double", Doubl
 type Service struct {
 	Name            string               `json:"name"`
 	Template        string               `json:"template,omitempty"`      // span semantics: "", "http-server", "http-client", "db", "messaging", "grpc"
-	InfraTemplate   string               `json:"infraTemplate,omitempty"` // infra context: "", "k8s", "eks", "gke", "aks", "ecs", "host", "docker", "lambda", "cloudfoundry", "process"
+	InfraTemplate   string               `json:"infraTemplate,omitempty"` // infra context: "", "k8s", "eks", "gke", "aks", "ecs", "host", "docker", "lambda", "cloudfoundry", "process", "otel-host", "otel-host-process"
 	SpanKind        string               `json:"spanKind"`                // server|client|internal|producer|consumer
 	FailureRate     int                  `json:"failureRate"`             // 0–100 %
 	Interval        int                  `json:"interval"`                // seconds between sends, minimum 1
@@ -100,6 +100,8 @@ type Service struct {
 	Signals         []string             `json:"signals"`                 // "spans","metrics","logs"; empty = all three
 	Attributes      map[string]AttrValue `json:"attributes"`              // resource-level; service.name always wins
 	SpanAttrs       map[string]AttrValue `json:"spanAttrs,omitempty"`     // span-level overrides for template-generated attributes
+	HostName        string               `json:"hostName,omitempty"`      // custom host.name for host-category infra templates
+	ProcessName     string               `json:"processName,omitempty"`   // custom process.executable.name for process infra templates
 	Mesh            bool                 `json:"mesh,omitempty"`
 	DownstreamCalls []string             `json:"downstreamCalls,omitempty"`
 	Metric          *MetricConfig        `json:"metric,omitempty"`
@@ -203,7 +205,8 @@ func normalizeService(svc Service) Service {
 	}
 	switch svc.InfraTemplate {
 	case "", "k8s", "eks", "gke", "aks", "ecs", "host", "docker", "lambda", "cloudfoundry", "process",
-		"openshift", "containerd", "nomad", "azure-functions", "gcp-functions", "azure-container-apps":
+		"openshift", "containerd", "nomad", "azure-functions", "gcp-functions", "azure-container-apps",
+		"otel-host", "otel-host-process":
 		// valid
 	default:
 		svc.InfraTemplate = ""
@@ -244,6 +247,8 @@ func normalizeService(svc Service) Service {
 		svc.Metric = &metric
 	}
 	svc.LogSeverity = strings.ToLower(strings.TrimSpace(svc.LogSeverity))
+	svc.HostName = strings.TrimSpace(svc.HostName)
+	svc.ProcessName = strings.TrimSpace(svc.ProcessName)
 	return svc
 }
 

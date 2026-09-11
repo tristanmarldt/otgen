@@ -45,13 +45,13 @@ const (
 	tabService = iota
 	tabSpans
 	tabCalls
-	tabMetricsLogs
 	tabInfrastructure
+	tabMetricsLogs
 	tabResourceAttrs
 	tabSpanAttrs
 )
 
-var serviceTabNames = []string{"Service", "Spans", "Calls", "Metrics & logs", "Infrastructure", "Resource attrs", "Span attrs"}
+var serviceTabNames = []string{"Service", "Spans", "Calls", "Infrastructure", "Metrics & logs", "Resource attrs", "Span attrs"}
 
 // ── model ─────────────────────────────────────────────────────────────────────
 
@@ -80,7 +80,9 @@ type tui struct {
 	fTemplate      string
 	fInfraCategory string // "" | "kubernetes" | "container" | "serverless" | "host" | "other"
 	fInfraTemplate string
-	fInfraStep     int // 0 = category select, 1 = template select
+	fInfraStep     int // 0 = category select, 1 = template select, 2 = host/process name
+	fHostName      string
+	fProcessName   string
 	fSpanKind      string
 	fFailure       string
 	fInterval      string
@@ -112,11 +114,11 @@ type tui struct {
 	flashEnd time.Time
 
 	// payload preview (screenPayload)
-	payloadSummary      string
-	payloadJSON         string
-	payloadMode         int // 0 = config summary, 1 = OTLP JSON
-	payloadScroll       int
-	payloadPrevScreen   tuiScreen
+	payloadSummary       string
+	payloadJSON          string
+	payloadMode          int // 0 = config summary, 1 = OTLP JSON
+	payloadScroll        int
+	payloadPrevScreen    tuiScreen
 	payloadPrevTabActive bool
 }
 
@@ -227,11 +229,18 @@ func (m *tui) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 // leaveForm handles Esc / abort out of an open form.
 func (m *tui) leaveForm() (tea.Model, tea.Cmd) {
 	if m.screen == screenServiceEdit {
-		// Infra step 1 (template): ESC walks back to step 0 (category).
-		if m.editTab == tabInfrastructure && m.fInfraStep == 1 {
-			m.fInfraStep = 0
-			m.form = m.makeServiceTabForm(tabInfrastructure)
-			return m, m.form.Init()
+		if m.editTab == tabInfrastructure {
+			// ESC walks back through infra steps: 2→1→0→tab selector.
+			if m.fInfraStep == 2 {
+				m.fInfraStep = 1
+				m.form = m.makeServiceTabForm(tabInfrastructure)
+				return m, m.form.Init()
+			}
+			if m.fInfraStep == 1 {
+				m.fInfraStep = 0
+				m.form = m.makeServiceTabForm(tabInfrastructure)
+				return m, m.form.Init()
+			}
 		}
 		m.fInfraStep = 0
 		m.tabActive = true
@@ -245,22 +254,28 @@ func (m *tui) leaveForm() (tea.Model, tea.Cmd) {
 func (m *tui) commitForm() (tea.Model, tea.Cmd) {
 	switch m.screen {
 	case screenServiceEdit:
-		// Infrastructure tab is a two-step flow: category → template.
-		if m.editTab == tabInfrastructure && m.fInfraStep == 0 {
-			if m.fInfraCategory == "" {
-				// "None" chosen — no template step needed; clear and return.
-				m.fInfraTemplate = ""
-				m.fInfraStep = 0
-				m.tabActive = true
-				m.form = nil
-				return m, nil
+		// Infrastructure tab is a multi-step flow: category → template → name(s).
+		if m.editTab == tabInfrastructure {
+			if m.fInfraStep == 0 {
+				if m.fInfraCategory == "" {
+					// "None" chosen — clear template and return.
+					m.fInfraTemplate = ""
+					m.fInfraStep = 0
+					m.tabActive = true
+					m.form = nil
+					return m, nil
+				}
+				m.fInfraStep = 1
+				m.form = m.makeServiceTabForm(tabInfrastructure)
+				return m, m.form.Init()
 			}
-			// Advance to template selection.
-			m.fInfraStep = 1
-			m.form = m.makeServiceTabForm(tabInfrastructure)
-			return m, m.form.Init()
+			if m.fInfraStep == 1 && infraNeedsNameStep(m.fInfraTemplate) {
+				m.fInfraStep = 2
+				m.form = m.makeServiceTabForm(tabInfrastructure)
+				return m, m.form.Init()
+			}
 		}
-		// All other tabs (and infra step 1): return to selector.
+		// All other tabs (and infra steps 1 without name step, or step 2): return to selector.
 		m.fInfraStep = 0
 		m.tabActive = true
 		m.form = nil
@@ -367,6 +382,8 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fTemplate = ""
 		m.fInfraCategory = ""
 		m.fInfraTemplate = ""
+		m.fHostName = ""
+		m.fProcessName = ""
 		m.fSpanKind = "server"
 		m.fFailure = "5"
 		m.fInterval = "5"
@@ -387,6 +404,8 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fTemplate = svc.Template
 		m.fInfraCategory = infraCategoryOf[svc.InfraTemplate]
 		m.fInfraTemplate = svc.InfraTemplate
+		m.fHostName = svc.HostName
+		m.fProcessName = svc.ProcessName
 		m.fSpanKind = svc.SpanKind
 		m.fFailure = strconv.Itoa(svc.FailureRate)
 		m.fInterval = strconv.Itoa(svc.Interval)
@@ -445,6 +464,8 @@ func (m *tui) buildServiceFromFields() Service {
 		Name:            strings.TrimSpace(m.fName),
 		Template:        m.fTemplate,
 		InfraTemplate:   m.fInfraTemplate,
+		HostName:        strings.TrimSpace(m.fHostName),
+		ProcessName:     strings.TrimSpace(m.fProcessName),
 		SpanKind:        m.fSpanKind,
 		FailureRate:     failRate,
 		Interval:        interval,
@@ -481,6 +502,7 @@ var infraCategoryOf = map[string]string{
 	"ecs": "container", "azure-container-apps": "container",
 	"lambda": "serverless", "azure-functions": "serverless", "gcp-functions": "serverless",
 	"host": "host", "process": "host",
+	"otel-host": "host", "otel-host-process": "host",
 	"nomad": "other", "cloudfoundry": "other",
 }
 
@@ -514,6 +536,8 @@ func infraTemplatesForCategory(cat string) []huh.Option[string] {
 		return []huh.Option[string]{
 			huh.NewOption("VM / bare metal", "host"),
 			huh.NewOption("Process", "process"),
+			huh.NewOption("OTel host", "otel-host"),
+			huh.NewOption("OTel host + process", "otel-host-process"),
 		}
 	case "other":
 		return []huh.Option[string]{
@@ -522,6 +546,39 @@ func infraTemplatesForCategory(cat string) []huh.Option[string] {
 		}
 	default: // "" = None
 		return []huh.Option[string]{huh.NewOption("—", "")}
+	}
+}
+
+// infraNeedsNameStep returns true for the five host-category templates that
+// prompt for a custom host name (and optionally process name) in step 2.
+func infraNeedsNameStep(template string) bool {
+	switch template {
+	case "host", "process", "otel-host", "otel-host-process":
+		return true
+	}
+	return false
+}
+
+// infraNeedsProcessName returns true for the three templates that also collect
+// a custom process.executable.name.
+func infraNeedsProcessName(template string) bool {
+	switch template {
+	case "process", "otel-host-process":
+		return true
+	}
+	return false
+}
+
+// infraHostNameDefault returns the placeholder / fallback host.name for each
+// host-category template, mirroring effectiveHostName in otlp.go.
+func infraHostNameDefault(template string) string {
+	switch template {
+	case "host":
+		return "prod-server-01"
+	case "process":
+		return "localhost"
+	default:
+		return "otel-host-01"
 	}
 }
 
@@ -652,41 +709,57 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 		).WithWidth(w)
 
 	case tabMetricsLogs:
-		return huh.NewForm(
-			huh.NewGroup(
-				huh.NewSelect[string]().
-					Title(settingsLabel("Metric type")).
-					Inline(true).
-					Options(
-						huh.NewOption("Sum", "sum"),
-						huh.NewOption("Gauge", "gauge"),
-						huh.NewOption("Histogram", "histogram"),
-					).
-					Description("Used when metrics are enabled").
-					Value(&m.fMetricType),
-				huh.NewInput().
-					Title(settingsLabel("Metric name")).
-					Inline(true).
-					Placeholder(metricPreview.Name).
-					Value(&m.fMetricName),
-				huh.NewInput().
-					Title(settingsLabel("Metric unit")).
-					Inline(true).
-					Placeholder(metricPreview.Unit).
-					Value(&m.fMetricUnit),
-				huh.NewSelect[string]().
-					Title(settingsLabel("Log severity")).
-					Inline(true).
-					Options(
-						huh.NewOption("DEBUG", "debug"),
-						huh.NewOption("INFO", "info"),
-						huh.NewOption("WARN", "warn"),
-						huh.NewOption("ERROR", "error"),
-					).
-					Description("Used when logs are enabled").
-					Value(&m.fLogSeverity),
-			),
-		).WithWidth(w)
+		metricsNote, _ := inheritedMetricsNote(Service{
+			Name:          strings.TrimSpace(m.fName),
+			InfraTemplate: m.fInfraTemplate,
+			Mesh:          m.fMesh,
+		}, w-4, max(2, m.textLines()-8))
+		metricFields := []huh.Field{
+			huh.NewSelect[string]().
+				Title(settingsLabel("Metric type")).
+				Inline(true).
+				Options(
+					huh.NewOption("Sum", "sum"),
+					huh.NewOption("Gauge", "gauge"),
+					huh.NewOption("Histogram", "histogram"),
+				).
+				Description("Used when metrics are enabled").
+				Value(&m.fMetricType),
+			huh.NewInput().
+				Title(settingsLabel("Metric name")).
+				Inline(true).
+				Placeholder(metricPreview.Name).
+				Value(&m.fMetricName),
+			huh.NewInput().
+				Title(settingsLabel("Metric unit")).
+				Inline(true).
+				Placeholder(metricPreview.Unit).
+				Value(&m.fMetricUnit),
+			huh.NewSelect[string]().
+				Title(settingsLabel("Log severity")).
+				Inline(true).
+				Options(
+					huh.NewOption("DEBUG", "debug"),
+					huh.NewOption("INFO", "info"),
+					huh.NewOption("WARN", "warn"),
+					huh.NewOption("ERROR", "error"),
+				).
+				Description("Used when logs are enabled").
+				Value(&m.fLogSeverity),
+		}
+		// Read-only context goes last, so the editable fields stay at the top
+		// of the tab where the cursor lands.
+		//
+		// On a short terminal it is dropped entirely: the four editable fields
+		// already fill ~16 rows and a huh Note costs several more in chrome
+		// alone, and huh cannot scroll a group that overflows. The tab summary
+		// still shows the count, and ctrl+q still lists every series.
+		if metricsNote != "" && m.textLines() >= 10 {
+			metricFields = append(metricFields, huh.NewNote().
+				Title("Also emitted (read-only)").
+				Description(metricsNote))
+		}
+		return huh.NewForm(huh.NewGroup(metricFields...)).WithWidth(w)
 
 	case tabInfrastructure:
 		// Two-step flow: category first, then the template within that category.
@@ -711,21 +784,41 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 				),
 			).WithWidth(w)
 		}
-		// step 1 — template within the chosen category
-		return huh.NewForm(
-			huh.NewGroup(
-				huh.NewSelect[string]().
-					Title("Infrastructure — template").
-					Description("Specific environment variant · / to filter · esc back to category").
-					Options(infraTemplatesForCategory(m.fInfraCategory)...).
-					Value(&m.fInfraTemplate),
-			),
-		).WithWidth(w)
+		if m.fInfraStep == 1 {
+			// step 1 — template within the chosen category
+			return huh.NewForm(
+				huh.NewGroup(
+					huh.NewSelect[string]().
+						Title("Infrastructure — template").
+						Description("Specific environment variant · / to filter · esc back to category").
+						Options(infraTemplatesForCategory(m.fInfraCategory)...).
+						Value(&m.fInfraTemplate),
+				),
+			).WithWidth(w)
+		}
+		// step 2 — host name (and optionally process name)
+		nameFields := []huh.Field{
+			huh.NewInput().
+				Title(settingsLabel("Host name")).
+				Description("host.name · leave blank for default · esc back to template").
+				Placeholder(infraHostNameDefault(m.fInfraTemplate)).
+				Value(&m.fHostName),
+		}
+		if infraNeedsProcessName(m.fInfraTemplate) {
+			nameFields = append(nameFields, huh.NewInput().
+				Title(settingsLabel("Process name")).
+				Description("process.executable.name · leave blank to use service name").
+				Placeholder(strings.TrimSpace(m.fName)).
+				Value(&m.fProcessName))
+		}
+		return huh.NewForm(huh.NewGroup(nameFields...)).WithWidth(w)
 
 	case tabResourceAttrs:
 		svcForNote := Service{
 			Name:          strings.TrimSpace(m.fName),
 			InfraTemplate: m.fInfraTemplate,
+			HostName:      strings.TrimSpace(m.fHostName),
+			ProcessName:   strings.TrimSpace(m.fProcessName),
 			Mesh:          m.fMesh,
 		}
 		resNote, resNoteLines := inheritedResAttrsNote(m.cfg, svcForNote, w-4)
@@ -1190,6 +1283,11 @@ func (m *tui) serviceTabSummaries() []string {
 		Type: m.fMetricType, Name: m.fMetricName, Unit: m.fMetricUnit,
 	}})
 	metricsLogs := fmt.Sprintf("%s %s · %s logs", metric.Type, metric.Name, strings.ToUpper(effectiveLogSeverity(Service{LogSeverity: m.fLogSeverity})))
+	// The infra template can add system.*/process.* metrics of its own; without
+	// this the extra series are invisible until you open the payload preview.
+	if n := len(infraMetricNames(m.fInfraTemplate)); n > 0 {
+		metricsLogs += fmt.Sprintf(" · +%d %s", n, m.fInfraTemplate)
+	}
 	infraTmpl := m.fInfraTemplate
 	if infraTmpl == "" {
 		infraTmpl = sMuted.Render("none")
@@ -1199,8 +1297,8 @@ func (m *tui) serviceTabSummaries() []string {
 		service,
 		spans,
 		calls,
-		metricsLogs,
 		infraTmpl,
+		metricsLogs,
 		attrSummary(m.fAttrs, len(infraDefaults(Service{Name: strings.TrimSpace(m.fName), InfraTemplate: m.fInfraTemplate}))),
 		attrSummary(m.fSpanAttrs, len(templateDefaults(m.fTemplate))),
 	}
@@ -1525,7 +1623,6 @@ func attrValueText(v AttrValue, quote bool) string {
 	}
 }
 
-
 // inheritedResAttrsNote returns a multi-line description of the resource
 // attributes inherited by svc from global config, infra template, and Istio
 // mesh. All attributes are shown (no truncation). Returns ("", 0) when nothing
@@ -1554,6 +1651,83 @@ func inheritedResAttrsNote(cfg Config, svc Service, budget int) (string, int) {
 		lines = append(lines, "service.name="+noteEscape(svc.Name)+" (always set)")
 	}
 	return strings.Join(lines, "\n"), len(lines)
+}
+
+// inheritedMetricsNote lists the metrics a service emits in addition to the one
+// configured on this tab: those the infra template contributes for Dynatrace
+// entity extraction, and the Istio mesh series. Both are otherwise invisible
+// until something fails to show up in Grail.
+//
+// Returns ("", 0) when the service emits nothing beyond its configured metric.
+func inheritedMetricsNote(svc Service, budget, maxLines int) (string, int) {
+	var lines []string
+
+	if names := infraMetricNames(svc.InfraTemplate); len(names) > 0 {
+		lines = append(lines, namesBlock(svc.InfraTemplate+" — creates "+entityKindsFor(svc.InfraTemplate), names, budget)...)
+	}
+	if svc.Mesh {
+		lines = append(lines, namesBlock("istio mesh", istioMetricNames, budget)...)
+	}
+	if len(lines) == 0 {
+		return "", 0
+	}
+	// huh cannot scroll a group that overflows its terminal, so trim rather
+	// than push the fields off screen. The marker gets a line of its own:
+	// appending it to the last content line makes that line re-wrap, which
+	// costs back the very row the trim was meant to save.
+	if maxLines > 0 && len(lines) > maxLines {
+		keep := maxLines - 1
+		if keep < 1 {
+			keep = 1
+		}
+		hidden := len(lines) - keep
+		lines = append(lines[:keep], fmt.Sprintf("  … +%d more (ctrl+q)", hidden))
+	}
+	return strings.Join(lines, "\n"), len(lines)
+}
+
+// entityKindsFor names the Dynatrace entities an infra template's metrics
+// create, so the note explains why the extra series are there.
+func entityKindsFor(template string) string {
+	switch template {
+	case "otel-host":
+		return "otel:host"
+	case "otel-host-process":
+		return "otel:host + otel:process"
+	}
+	return "entities"
+}
+
+// namesBlock renders a labelled, width-wrapped list of metric names, matching
+// how attrsBlock lays out inherited attributes.
+func namesBlock(label string, names []string, lineWidth int) []string {
+	header := fmt.Sprintf("%s (%d)", noteEscape(label), len(names))
+	if len(names) == 0 {
+		return []string{header}
+	}
+	width := lineWidth - 2 // 2-char indent on wrapped lines
+	if width < 20 {
+		width = 20
+	}
+	var out, cur []string
+	used := 0
+	for _, n := range names {
+		item := noteEscape(n)
+		add := len(item)
+		if len(cur) > 0 {
+			add += 2
+		}
+		if len(cur) > 0 && used+add > width {
+			out = append(out, "  "+strings.Join(cur, "  "))
+			cur, used, add = nil, 0, len(item)
+		}
+		cur = append(cur, item)
+		used += add
+	}
+	if len(cur) > 0 {
+		out = append(out, "  "+strings.Join(cur, "  "))
+	}
+	return append([]string{header}, out...)
 }
 
 // inheritedSpanAttrsNote returns a multi-line description of the span
@@ -1922,6 +2096,11 @@ func (m *tui) buildPayloadPreview(svc Service) string {
 	if svc.hasSignal(signalMetrics) {
 		mc := effectiveMetricConfig(svc)
 		addRow("Metric", fmt.Sprintf("%s %s (%s)", mc.Name, mc.Unit, mc.Type))
+		// Dynatrace entity extraction routes on the metric key, so spell these
+		// out rather than leaving the reader to infer them from the template.
+		for _, im := range infraMetrics(svc, time.Now()) {
+			addRow("", fmt.Sprintf("%s %s%s", im.Name, im.Unit, sMuted.Render("  (from "+svc.InfraTemplate+")")))
+		}
 	}
 	if svc.hasSignal(signalLogs) {
 		addRow("Log severity", strings.ToUpper(effectiveLogSeverity(svc)))

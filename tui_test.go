@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -356,4 +357,70 @@ func stripANSI(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// TestMetricsTabFitsWithInheritedNote covers the case
+// TestEditorTabsFitStandardTerminal misses: its fixture has no infra metrics
+// and no mesh, so the "Also emitted" note is empty. With both present the note
+// is at its longest, and huh cannot scroll a group that overflows its terminal.
+func TestMetricsTabFitsWithInheritedNote(t *testing.T) {
+	// 20 rows matters as much as 24: it is short enough to force the note's
+	// truncation path, where an over-long "+N more" marker re-wraps and costs
+	// back the row the trim was meant to save.
+	for _, rows := range []int{20, 24, 30} {
+		testMetricsTabFits(t, rows)
+	}
+}
+
+func testMetricsTabFits(t *testing.T, rows int) {
+	t.Helper()
+	for _, tc := range []struct {
+		name string
+		tmpl string
+		mesh bool
+	}{
+		{"otel-host", "otel-host", false},
+		{"otel-host-process", "otel-host-process", false},
+		{"otel-host-process + mesh", "otel-host-process", true},
+	} {
+		t.Run(fmt.Sprintf("%s@%drows", tc.name, rows), func(t *testing.T) {
+			m := testTUI(t)
+			m.width, m.height = 80, rows
+			m.loadServiceFields(0)
+			m.fInfraTemplate, m.fMesh = tc.tmpl, tc.mesh
+			m.screen, m.tabActive, m.editTab = screenServiceEdit, false, tabMetricsLogs
+			m.form = m.makeServiceTabForm(tabMetricsLogs)
+			m.form.Init()
+			if got := strings.Count(m.View(), "\n") + 1; got > rows {
+				t.Errorf("Metrics & logs renders %d rows, exceeding a %d-row terminal", got, rows)
+			}
+		})
+	}
+}
+
+// TestInheritedMetricsNoteNamesTheSeries checks the note actually lists what
+// the service emits beyond its configured metric, and escapes underscores for
+// huh's markdown mini-renderer (system.cpu.load_average.1m would otherwise
+// render as italics).
+func TestInheritedMetricsNoteNamesTheSeries(t *testing.T) {
+	note, lines := inheritedMetricsNote(Service{Name: "svc", InfraTemplate: "otel-host-process"}, 76, 0)
+	if lines == 0 {
+		t.Fatal("no note for a template that emits metrics")
+	}
+	for _, want := range []string{"system.cpu.utilization", "process.memory.usage", "otel:host", "otel:process"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("note missing %q:\n%s", want, note)
+		}
+	}
+	if strings.Contains(note, "load_average") {
+		t.Error("underscore not escaped — huh renders it as italics")
+	}
+	if !strings.Contains(note, `load\_average`) {
+		t.Errorf("expected escaped underscore in:\n%s", note)
+	}
+
+	// A template that contributes nothing must not draw an empty note box.
+	if note, lines := inheritedMetricsNote(Service{Name: "svc", InfraTemplate: "k8s"}, 76, 0); note != "" || lines != 0 {
+		t.Errorf("k8s should produce no note, got %d lines: %q", lines, note)
+	}
 }

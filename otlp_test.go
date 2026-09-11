@@ -1,12 +1,16 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 
 	collectormetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	collectortracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -136,6 +140,115 @@ func TestK8sInfraTemplatesCarryDynatraceAttributes(t *testing.T) {
 	}
 }
 
+// md5hex returns the MD5 hex digest of s — mirrors hostID in otlp.go.
+func md5hex(s string) string {
+	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// TestOtelInfraTemplatesCarryEntityIdentityAttributes verifies that each OTel
+// infra template includes the resource attributes Dynatrace requires to extract
+// OTEL_HOST and OTEL_PROCESS Smartscape entities.
+func TestOtelInfraTemplatesCarryEntityIdentityAttributes(t *testing.T) {
+	hostRequired := []string{"host.id", "host.name", "telemetry.sdk.name"}
+	processRequired := append(hostRequired, "process.executable.name")
+
+	cases := []struct {
+		template string
+		required []string
+	}{
+		{"otel-host", hostRequired},
+		{"otel-host-process", processRequired},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.template, func(t *testing.T) {
+			attrs := infraDefaults(Service{Name: "my-svc", InfraTemplate: tc.template})
+			for _, key := range tc.required {
+				v, ok := attrs[key]
+				if !ok {
+					t.Errorf("missing %s", key)
+					continue
+				}
+				if v.Type != "string" || v.Str == "" {
+					t.Errorf("%s should be a non-empty string, got %+v", key, v)
+				}
+			}
+			// host.id must be MD5 of host.name
+			wantID := md5hex(attrs["host.name"].Str)
+			if got := attrs["host.id"].Str; got != wantID {
+				t.Errorf("host.id = %q, want MD5(%q) = %q", got, attrs["host.name"].Str, wantID)
+			}
+			if _, hasProc := attrs["process.executable.name"]; hasProc {
+				if attrs["process.executable.name"].Str != "my-svc" {
+					t.Errorf("process.executable.name = %q, want my-svc", attrs["process.executable.name"].Str)
+				}
+			}
+		})
+	}
+}
+
+// TestHostCategoryTemplatesHaveHostID verifies that all five host-category
+// templates now carry host.id (a 32-char MD5 of host.name).
+func TestHostCategoryTemplatesHaveHostID(t *testing.T) {
+	for _, tmpl := range []string{"host", "process", "otel-host", "otel-host-process"} {
+		t.Run(tmpl, func(t *testing.T) {
+			attrs := infraDefaults(Service{Name: "svc", InfraTemplate: tmpl})
+			hn, ok := attrs["host.name"]
+			if !ok {
+				t.Fatal("missing host.name")
+			}
+			id, ok := attrs["host.id"]
+			if !ok {
+				t.Fatal("missing host.id")
+			}
+			if want := md5hex(hn.Str); id.Str != want {
+				t.Errorf("host.id = %q, want MD5(%q) = %q", id.Str, hn.Str, want)
+			}
+		})
+	}
+}
+
+// TestCustomHostAndProcessName verifies that HostName and ProcessName struct
+// fields propagate correctly through infraDefaults.
+func TestCustomHostAndProcessName(t *testing.T) {
+	processTemplates := []string{"process", "otel-host-process"}
+	hostTemplates := []string{"host", "otel-host"}
+
+	for _, tmpl := range append(hostTemplates, processTemplates...) {
+		t.Run(tmpl+"/custom-host", func(t *testing.T) {
+			svc := Service{Name: "svc", InfraTemplate: tmpl, HostName: "my-custom-host"}
+			attrs := infraDefaults(svc)
+			if got := attrs["host.name"].Str; got != "my-custom-host" {
+				t.Errorf("host.name = %q, want my-custom-host", got)
+			}
+			if want := md5hex("my-custom-host"); attrs["host.id"].Str != want {
+				t.Errorf("host.id = %q, want MD5(my-custom-host) = %q", attrs["host.id"].Str, want)
+			}
+		})
+	}
+
+	for _, tmpl := range processTemplates {
+		t.Run(tmpl+"/custom-process", func(t *testing.T) {
+			svc := Service{Name: "svc", InfraTemplate: tmpl, ProcessName: "my-proc"}
+			attrs := infraDefaults(svc)
+			if got := attrs["process.executable.name"].Str; got != "my-proc" {
+				t.Errorf("process.executable.name = %q, want my-proc", got)
+			}
+			if got := attrs["process.command_line"].Str; !strings.Contains(got, "my-proc") {
+				t.Errorf("process.command_line = %q, want to contain my-proc", got)
+			}
+		})
+		t.Run(tmpl+"/default-process-falls-back-to-service-name", func(t *testing.T) {
+			svc := Service{Name: "svc", InfraTemplate: tmpl}
+			attrs := infraDefaults(svc)
+			if got := attrs["process.executable.name"].Str; got != "svc" {
+				t.Errorf("process.executable.name = %q, want svc", got)
+			}
+		})
+	}
+}
+
 // TestTemplateSpanAttributes verifies that each template produces the expected
 // semantic-convention attributes on the root span.
 func TestTemplateSpanAttributes(t *testing.T) {
@@ -236,6 +349,155 @@ func TestIstioMetricsAddStandardMeshMetrics(t *testing.T) {
 	for name, found := range want {
 		if !found {
 			t.Errorf("missing metric %q", name)
+		}
+	}
+}
+
+// TestInfraTemplatesEmitEntityMetrics is the regression guard for the failure
+// that made otel-host look correct on the wire but create no Dynatrace entity:
+// the OTel host extension routes on the metric KEY, so a template with perfect
+// resource attributes and no system.*/process.* metric extracts nothing.
+func TestInfraTemplatesEmitEntityMetrics(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		template    string
+		wantSystem  bool
+		wantProcess bool
+	}{
+		{"otel-host", true, false},
+		{"otel-host-process", true, true},
+		{"k8s", false, false},
+		{"", false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.template, func(t *testing.T) {
+			var gotSystem, gotProcess bool
+			for _, m := range infraMetrics(Service{Name: "svc", InfraTemplate: tc.template}, now) {
+				if strings.HasPrefix(m.Name, "system.") {
+					gotSystem = true
+				}
+				if strings.HasPrefix(m.Name, "process.") {
+					gotProcess = true
+				}
+			}
+			if gotSystem != tc.wantSystem {
+				t.Errorf("system.* metric emitted = %v, want %v (otel:host extraction depends on it)", gotSystem, tc.wantSystem)
+			}
+			if gotProcess != tc.wantProcess {
+				t.Errorf("process.* metric emitted = %v, want %v (otel:process extraction depends on it)", gotProcess, tc.wantProcess)
+			}
+		})
+	}
+}
+
+// TestInfraMetricsAreStateless pins the shapes that let infraMetrics stay a
+// pure function of (svc, now): gauges carry no start time, and sums are
+// non-monotonic cumulative. A delta monotonic sum here would need its start
+// timestamp chained to the previous emission, which otgen does not track.
+func TestInfraMetricsAreStateless(t *testing.T) {
+	for _, m := range infraMetrics(Service{Name: "svc", InfraTemplate: "otel-host-process"}, time.Now()) {
+		switch data := m.Data.(type) {
+		case *metricspb.Metric_Gauge:
+			for _, dp := range data.Gauge.DataPoints {
+				if dp.StartTimeUnixNano != 0 {
+					t.Errorf("%s: gauge must not set StartTimeUnixNano", m.Name)
+				}
+			}
+		case *metricspb.Metric_Sum:
+			if data.Sum.IsMonotonic {
+				t.Errorf("%s: monotonic sums need per-emission delta state; use a gauge or a non-monotonic sum", m.Name)
+			}
+			if data.Sum.AggregationTemporality != metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE {
+				t.Errorf("%s: temporality = %v, want CUMULATIVE", m.Name, data.Sum.AggregationTemporality)
+			}
+			for _, dp := range data.Sum.DataPoints {
+				if dp.StartTimeUnixNano == 0 {
+					t.Errorf("%s: cumulative sum must set StartTimeUnixNano", m.Name)
+				}
+			}
+		default:
+			t.Errorf("%s: unexpected data type %T", m.Name, m.Data)
+		}
+		if m.Unit == "" {
+			t.Errorf("%s: missing unit", m.Name)
+		}
+	}
+}
+
+// TestHostMemoryMetricsAgree guards the one cross-metric invariant: usage and
+// utilization are derived from a single draw, so a host never reports 80% used
+// on one chart and 30% on another.
+func TestHostMemoryMetricsAgree(t *testing.T) {
+	now := time.Now()
+	var usedBytes, totalBytes int64
+	var usedFraction float64
+	for _, m := range infraMetrics(Service{Name: "svc", InfraTemplate: "otel-host"}, now) {
+		switch m.Name {
+		case "system.memory.usage":
+			for _, dp := range m.GetSum().DataPoints {
+				totalBytes += dp.GetAsInt()
+				for _, kv := range dp.Attributes {
+					if kv.Key == "state" && kv.Value.GetStringValue() == "used" {
+						usedBytes = dp.GetAsInt()
+					}
+				}
+			}
+		case "system.memory.utilization":
+			for _, dp := range m.GetGauge().DataPoints {
+				for _, kv := range dp.Attributes {
+					if kv.Key == "state" && kv.Value.GetStringValue() == "used" {
+						usedFraction = dp.GetAsDouble()
+					}
+				}
+			}
+		}
+	}
+	if totalBytes != hostMemoryBytes {
+		t.Errorf("memory states sum to %d, want %d", totalBytes, hostMemoryBytes)
+	}
+	if got := float64(usedBytes) / float64(hostMemoryBytes); got < usedFraction-0.001 || got > usedFraction+0.001 {
+		t.Errorf("usage implies %.4f utilization, but utilization reports %.4f", got, usedFraction)
+	}
+}
+
+// TestInfraMetricNamesMatchInfraMetrics keeps the UI's name list in step with
+// what is actually emitted. infraMetricNames exists so the editor can describe
+// a template without building throwaway protos on every render, and a stale
+// copy would quietly advertise metrics the generator no longer sends.
+func TestInfraMetricNamesMatchInfraMetrics(t *testing.T) {
+	for _, template := range []string{"otel-host", "otel-host-process", "k8s", ""} {
+		t.Run(template, func(t *testing.T) {
+			var emitted []string
+			for _, m := range infraMetrics(Service{Name: "svc", InfraTemplate: template}, time.Now()) {
+				emitted = append(emitted, m.Name)
+			}
+			declared := infraMetricNames(template)
+			if len(declared) != len(emitted) {
+				t.Fatalf("infraMetricNames lists %d metrics, infraMetrics emits %d\n  listed:  %v\n  emitted: %v",
+					len(declared), len(emitted), declared, emitted)
+			}
+			for i := range emitted {
+				if declared[i] != emitted[i] {
+					t.Errorf("index %d: listed %q, emitted %q", i, declared[i], emitted[i])
+				}
+			}
+		})
+	}
+}
+
+// TestIstioMetricNamesMatchIstioMetrics is the same guard for the mesh series.
+func TestIstioMetricNamesMatchIstioMetrics(t *testing.T) {
+	var emitted []string
+	for _, m := range istioMetrics(Service{Name: "svc"}, time.Now(), false) {
+		emitted = append(emitted, m.Name)
+	}
+	if len(istioMetricNames) != len(emitted) {
+		t.Fatalf("istioMetricNames = %v, istioMetrics emits %v", istioMetricNames, emitted)
+	}
+	for i := range emitted {
+		if istioMetricNames[i] != emitted[i] {
+			t.Errorf("index %d: listed %q, emitted %q", i, istioMetricNames[i], emitted[i])
 		}
 	}
 }
