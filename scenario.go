@@ -291,6 +291,9 @@ func metricsExportRequest(cfg Config, svc Service, now time.Time) (*collectormet
 	if svc.Mesh {
 		metrics = append(metrics, istioMetrics(svc, now, failed)...)
 	}
+	// Infra templates that map to Dynatrace entities must also emit a metric
+	// whose key matches system.* / process.*; the extension routes on the key.
+	metrics = append(metrics, infraMetrics(svc, now)...)
 	return &collectormetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
 		Resource: &resourcepb.Resource{Attributes: svcAttributes(cfg, svc)},
 		ScopeMetrics: []*metricspb.ScopeMetrics{{

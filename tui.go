@@ -45,13 +45,13 @@ const (
 	tabService = iota
 	tabSpans
 	tabCalls
-	tabMetricsLogs
 	tabInfrastructure
+	tabMetricsLogs
 	tabResourceAttrs
 	tabSpanAttrs
 )
 
-var serviceTabNames = []string{"Service", "Spans", "Calls", "Metrics & logs", "Infrastructure", "Resource attrs", "Span attrs"}
+var serviceTabNames = []string{"Service", "Spans", "Calls", "Infrastructure", "Metrics & logs", "Resource attrs", "Span attrs"}
 
 // ── model ─────────────────────────────────────────────────────────────────────
 
@@ -114,11 +114,11 @@ type tui struct {
 	flashEnd time.Time
 
 	// payload preview (screenPayload)
-	payloadSummary      string
-	payloadJSON         string
-	payloadMode         int // 0 = config summary, 1 = OTLP JSON
-	payloadScroll       int
-	payloadPrevScreen   tuiScreen
+	payloadSummary       string
+	payloadJSON          string
+	payloadMode          int // 0 = config summary, 1 = OTLP JSON
+	payloadScroll        int
+	payloadPrevScreen    tuiScreen
 	payloadPrevTabActive bool
 }
 
@@ -1267,6 +1267,11 @@ func (m *tui) serviceTabSummaries() []string {
 		Type: m.fMetricType, Name: m.fMetricName, Unit: m.fMetricUnit,
 	}})
 	metricsLogs := fmt.Sprintf("%s %s · %s logs", metric.Type, metric.Name, strings.ToUpper(effectiveLogSeverity(Service{LogSeverity: m.fLogSeverity})))
+	// The infra template can add system.*/process.* metrics of its own; without
+	// this the extra series are invisible until you open the payload preview.
+	if n := len(infraMetrics(Service{InfraTemplate: m.fInfraTemplate}, time.Now())); n > 0 {
+		metricsLogs += fmt.Sprintf(" · +%d %s", n, m.fInfraTemplate)
+	}
 	infraTmpl := m.fInfraTemplate
 	if infraTmpl == "" {
 		infraTmpl = sMuted.Render("none")
@@ -1276,8 +1281,8 @@ func (m *tui) serviceTabSummaries() []string {
 		service,
 		spans,
 		calls,
-		metricsLogs,
 		infraTmpl,
+		metricsLogs,
 		attrSummary(m.fAttrs, len(infraDefaults(Service{Name: strings.TrimSpace(m.fName), InfraTemplate: m.fInfraTemplate}))),
 		attrSummary(m.fSpanAttrs, len(templateDefaults(m.fTemplate))),
 	}
@@ -1601,7 +1606,6 @@ func attrValueText(v AttrValue, quote bool) string {
 		return v.Str
 	}
 }
-
 
 // inheritedResAttrsNote returns a multi-line description of the resource
 // attributes inherited by svc from global config, infra template, and Istio
@@ -1999,6 +2003,11 @@ func (m *tui) buildPayloadPreview(svc Service) string {
 	if svc.hasSignal(signalMetrics) {
 		mc := effectiveMetricConfig(svc)
 		addRow("Metric", fmt.Sprintf("%s %s (%s)", mc.Name, mc.Unit, mc.Type))
+		// Dynatrace entity extraction routes on the metric key, so spell these
+		// out rather than leaving the reader to infer them from the template.
+		for _, im := range infraMetrics(svc, time.Now()) {
+			addRow("", fmt.Sprintf("%s %s%s", im.Name, im.Unit, sMuted.Render("  (from "+svc.InfraTemplate+")")))
+		}
 	}
 	if svc.hasSignal(signalLogs) {
 		addRow("Log severity", strings.ToUpper(effectiveLogSeverity(svc)))

@@ -693,3 +693,125 @@ func boolAttr(key string, value bool) *commonpb.KeyValue {
 func doubleAttr(key string, value float64) *commonpb.KeyValue {
 	return &commonpb.KeyValue{Key: key, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_DoubleValue{DoubleValue: value}}}
 }
+
+// ── infra template metrics ────────────────────────────────────────────────────
+
+// hostMemoryBytes is the memory size modelled for synthetic OTel hosts, so that
+// system.memory.usage and system.memory.utilization agree with each other.
+const hostMemoryBytes int64 = 16 << 30
+
+// otgenStart stands in for host/process boot time. Cumulative sums need a start
+// timestamp; a fixed one per run is what a real SDK reports and keeps metric
+// generation a pure function of (svc, now).
+var otgenStart = time.Now()
+
+// infraMetrics returns the metrics an infra template must emit for Dynatrace
+// entity extraction, mirroring how infraDefaults supplies its attributes.
+//
+// The OpenTelemetry Host Monitoring extension routes on the metric KEY, not on
+// resource attributes alone: a system.* metric creates the otel:host entity and
+// a process.* metric creates otel:process. Without one, a resource carrying a
+// perfectly correct host.id / host.name / telemetry.sdk.name produces no entity
+// at all.
+//
+// Only gauges and non-monotonic cumulative sums are emitted. Delta monotonic
+// sums (system.cpu.time, system.network.io, …) would need StartTimeUnixNano
+// chained to the previous emission, and therefore per-service state that
+// buildEmissionPayloads deliberately does not carry.
+func infraMetrics(svc Service, now time.Time) []*metricspb.Metric {
+	switch svc.InfraTemplate {
+	case "otel-host":
+		return hostVitalMetrics(now)
+	case "otel-host-process":
+		return append(hostVitalMetrics(now), processVitalMetrics(now)...)
+	}
+	return nil
+}
+
+// gaugeMetric builds a single-valued Gauge. Gauges carry neither aggregation
+// temporality nor a start timestamp.
+func gaugeMetric(name, unit string, now time.Time, points []*metricspb.NumberDataPoint) *metricspb.Metric {
+	return &metricspb.Metric{
+		Name: name, Unit: unit,
+		Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: points}},
+	}
+}
+
+// cumulativeSum builds a non-monotonic cumulative Sum — the shape the
+// hostmetrics receiver uses for "current size" metrics such as memory usage.
+// These survive the reference collector's cumulative_to_delta unchanged, which
+// only converts monotonic sums.
+func cumulativeSum(name, unit string, now time.Time, points []*metricspb.NumberDataPoint) *metricspb.Metric {
+	for _, dp := range points {
+		dp.StartTimeUnixNano = uint64(otgenStart.UnixNano())
+	}
+	return &metricspb.Metric{
+		Name: name, Unit: unit,
+		Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+			AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+			IsMonotonic:            false,
+			DataPoints:             points,
+		}},
+	}
+}
+
+func doublePoint(now time.Time, v float64, attrs ...*commonpb.KeyValue) *metricspb.NumberDataPoint {
+	return &metricspb.NumberDataPoint{
+		TimeUnixNano: uint64(now.UnixNano()), Attributes: attrs,
+		Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: v},
+	}
+}
+
+func intPoint(now time.Time, v int64, attrs ...*commonpb.KeyValue) *metricspb.NumberDataPoint {
+	return &metricspb.NumberDataPoint{
+		TimeUnixNano: uint64(now.UnixNano()), Attributes: attrs,
+		Value: &metricspb.NumberDataPoint_AsInt{AsInt: v},
+	}
+}
+
+// hostVitalMetrics returns the system.* metrics that create the otel:host
+// entity and populate the extension's headline host charts. Values are derived
+// from one draw so that usage and utilization stay consistent.
+func hostVitalMetrics(now time.Time) []*metricspb.Metric {
+	usedFraction := 0.25 + mathrand.Float64()*0.5
+	usedBytes := int64(float64(hostMemoryBytes) * usedFraction)
+	cpuUtilization := 0.05 + mathrand.Float64()*0.7
+
+	return []*metricspb.Metric{
+		// The reference pipeline filters out state=idle and averages across
+		// cores, leaving one attribute-less value — so emit exactly that.
+		gaugeMetric("system.cpu.utilization", "1", now, []*metricspb.NumberDataPoint{
+			doublePoint(now, cpuUtilization),
+		}),
+		gaugeMetric("system.cpu.load_average.1m", "{thread}", now, []*metricspb.NumberDataPoint{
+			doublePoint(now, cpuUtilization*8),
+		}),
+		gaugeMetric("system.memory.utilization", "1", now, []*metricspb.NumberDataPoint{
+			doublePoint(now, usedFraction, stringAttr("state", "used")),
+			doublePoint(now, 1-usedFraction, stringAttr("state", "free")),
+		}),
+		cumulativeSum("system.memory.usage", "By", now, []*metricspb.NumberDataPoint{
+			intPoint(now, usedBytes, stringAttr("state", "used")),
+			intPoint(now, hostMemoryBytes-usedBytes, stringAttr("state", "free")),
+		}),
+	}
+}
+
+// processVitalMetrics returns the process.* metrics that create the
+// otel:process entity. The process is identified by the resource's
+// process.executable.name, so these carry no identifying attributes of their own.
+func processVitalMetrics(now time.Time) []*metricspb.Metric {
+	residentBytes := int64(64<<20) + int64(mathrand.IntN(512<<20))
+	return []*metricspb.Metric{
+		gaugeMetric("process.cpu.utilization", "1", now, []*metricspb.NumberDataPoint{
+			doublePoint(now, 0.01+mathrand.Float64()*0.3),
+		}),
+		cumulativeSum("process.memory.usage", "By", now, []*metricspb.NumberDataPoint{
+			intPoint(now, residentBytes),
+		}),
+		// Virtual is reliably a multiple of resident, so the two charts track.
+		cumulativeSum("process.memory.virtual", "By", now, []*metricspb.NumberDataPoint{
+			intPoint(now, residentBytes*5/2),
+		}),
+	}
+}
