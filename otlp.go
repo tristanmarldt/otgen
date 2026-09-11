@@ -174,8 +174,33 @@ func hostID(name string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// infraUsesHostName reports whether a template's attributes include host.name,
+// and therefore whether Service.HostName means anything for it.
+func infraUsesHostName(template string) bool {
+	switch template {
+	case "host", "process", "otel-host", "otel-host-process":
+		return true
+	}
+	return false
+}
+
+// infraUsesProcessName reports the same for process.executable.name.
+func infraUsesProcessName(template string) bool {
+	switch template {
+	case "process", "otel-host-process":
+		return true
+	}
+	return false
+}
+
 // effectiveHostName returns the user-supplied HostName when set, otherwise the
-// per-template placeholder for host-category infra templates.
+// per-template default.
+//
+// The otel-* templates derive their default from the service name rather than
+// sharing a constant. host.id is an MD5 of host.name, so a shared default would
+// silently merge every otel-host service into one Dynatrace entity fed by
+// several independent system.* streams. To model several processes on one host,
+// give them the same explicit host name.
 func effectiveHostName(svc Service) string {
 	if svc.HostName != "" {
 		return svc.HostName
@@ -186,7 +211,7 @@ func effectiveHostName(svc Service) string {
 	case "process":
 		return "localhost"
 	default:
-		return "otel-host-01"
+		return svc.Name + "-host"
 	}
 }
 

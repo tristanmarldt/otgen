@@ -188,7 +188,7 @@ func TestOtelInfraTemplatesCarryEntityIdentityAttributes(t *testing.T) {
 	}
 }
 
-// TestHostCategoryTemplatesHaveHostID verifies that all five host-category
+// TestHostCategoryTemplatesHaveHostID verifies that all four host-category
 // templates now carry host.id (a 32-char MD5 of host.name).
 func TestHostCategoryTemplatesHaveHostID(t *testing.T) {
 	for _, tmpl := range []string{"host", "process", "otel-host", "otel-host-process"} {
@@ -499,5 +499,70 @@ func TestIstioMetricNamesMatchIstioMetrics(t *testing.T) {
 		if istioMetricNames[i] != emitted[i] {
 			t.Errorf("index %d: listed %q, emitted %q", i, istioMetricNames[i], emitted[i])
 		}
+	}
+}
+
+// TestOtelHostsDoNotCollideByDefault guards the failure mode the shared
+// "otel-host-01" default produced once these templates started creating
+// entities: host.id is an MD5 of host.name, so two otel-host services left at
+// their default merged into one Dynatrace entity fed by two independent
+// system.* streams, which charts as noise.
+func TestOtelHostsDoNotCollideByDefault(t *testing.T) {
+	for _, tmpl := range []string{"otel-host", "otel-host-process"} {
+		t.Run(tmpl, func(t *testing.T) {
+			a := infraDefaults(Service{Name: "checkout", InfraTemplate: tmpl})
+			b := infraDefaults(Service{Name: "inventory", InfraTemplate: tmpl})
+			if a["host.name"].Str == b["host.name"].Str {
+				t.Errorf("two services share host.name %q by default", a["host.name"].Str)
+			}
+			if a["host.id"].Str == b["host.id"].Str {
+				t.Error("two services share host.id by default — they would merge into one entity")
+			}
+		})
+	}
+
+	// Sharing a host stays possible, it just has to be asked for: this is how
+	// you model several processes on one machine.
+	shared := "shared-host"
+	a := infraDefaults(Service{Name: "checkout", InfraTemplate: "otel-host-process", HostName: shared})
+	b := infraDefaults(Service{Name: "inventory", InfraTemplate: "otel-host-process", HostName: shared})
+	if a["host.id"].Str != b["host.id"].Str {
+		t.Error("explicit identical host names should produce one shared host entity")
+	}
+	if a["process.executable.name"].Str == b["process.executable.name"].Str {
+		t.Error("processes on a shared host must stay distinct")
+	}
+}
+
+// TestNameOverridesClearedForUnrelatedTemplates stops host/process names being
+// persisted onto templates that never read them.
+func TestNameOverridesClearedForUnrelatedTemplates(t *testing.T) {
+	svc := normalizeService(Service{
+		Name: "svc", InfraTemplate: "k8s",
+		HostName: "leftover-host", ProcessName: "leftover-proc",
+	})
+	if svc.HostName != "" || svc.ProcessName != "" {
+		t.Errorf("k8s kept HostName=%q ProcessName=%q", svc.HostName, svc.ProcessName)
+	}
+
+	// A host template keeps its host name but not a process name it cannot use.
+	svc = normalizeService(Service{
+		Name: "svc", InfraTemplate: "otel-host",
+		HostName: "web-01", ProcessName: "leftover-proc",
+	})
+	if svc.HostName != "web-01" {
+		t.Errorf("HostName = %q, want web-01", svc.HostName)
+	}
+	if svc.ProcessName != "" {
+		t.Errorf("otel-host has no process, but kept ProcessName=%q", svc.ProcessName)
+	}
+
+	// The template that uses both keeps both.
+	svc = normalizeService(Service{
+		Name: "svc", InfraTemplate: "otel-host-process",
+		HostName: "web-01", ProcessName: "java",
+	})
+	if svc.HostName != "web-01" || svc.ProcessName != "java" {
+		t.Errorf("otel-host-process dropped names: %+v", svc)
 	}
 }

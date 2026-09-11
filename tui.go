@@ -269,7 +269,7 @@ func (m *tui) commitForm() (tea.Model, tea.Cmd) {
 				m.form = m.makeServiceTabForm(tabInfrastructure)
 				return m, m.form.Init()
 			}
-			if m.fInfraStep == 1 && infraNeedsNameStep(m.fInfraTemplate) {
+			if m.fInfraStep == 1 && infraUsesHostName(m.fInfraTemplate) {
 				m.fInfraStep = 2
 				m.form = m.makeServiceTabForm(tabInfrastructure)
 				return m, m.form.Init()
@@ -549,39 +549,6 @@ func infraTemplatesForCategory(cat string) []huh.Option[string] {
 	}
 }
 
-// infraNeedsNameStep returns true for the five host-category templates that
-// prompt for a custom host name (and optionally process name) in step 2.
-func infraNeedsNameStep(template string) bool {
-	switch template {
-	case "host", "process", "otel-host", "otel-host-process":
-		return true
-	}
-	return false
-}
-
-// infraNeedsProcessName returns true for the three templates that also collect
-// a custom process.executable.name.
-func infraNeedsProcessName(template string) bool {
-	switch template {
-	case "process", "otel-host-process":
-		return true
-	}
-	return false
-}
-
-// infraHostNameDefault returns the placeholder / fallback host.name for each
-// host-category template, mirroring effectiveHostName in otlp.go.
-func infraHostNameDefault(template string) string {
-	switch template {
-	case "host":
-		return "prod-server-01"
-	case "process":
-		return "localhost"
-	default:
-		return "otel-host-01"
-	}
-}
-
 func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 	w := m.formWidth()
 	metricPreview := effectiveMetricConfig(Service{
@@ -801,10 +768,10 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 			huh.NewInput().
 				Title(settingsLabel("Host name")).
 				Description("host.name · leave blank for default · esc back to template").
-				Placeholder(infraHostNameDefault(m.fInfraTemplate)).
+				Placeholder(effectiveHostName(Service{Name: strings.TrimSpace(m.fName), InfraTemplate: m.fInfraTemplate})).
 				Value(&m.fHostName),
 		}
-		if infraNeedsProcessName(m.fInfraTemplate) {
+		if infraUsesProcessName(m.fInfraTemplate) {
 			nameFields = append(nameFields, huh.NewInput().
 				Title(settingsLabel("Process name")).
 				Description("process.executable.name · leave blank to use service name").
@@ -1291,6 +1258,19 @@ func (m *tui) serviceTabSummaries() []string {
 	infraTmpl := m.fInfraTemplate
 	if infraTmpl == "" {
 		infraTmpl = sMuted.Render("none")
+	} else if infraUsesHostName(m.fInfraTemplate) {
+		// These names are the Dynatrace entity identity, so show them here
+		// rather than making the user open the tab to find out.
+		svcForNames := Service{
+			Name:          strings.TrimSpace(m.fName),
+			InfraTemplate: m.fInfraTemplate,
+			HostName:      strings.TrimSpace(m.fHostName),
+			ProcessName:   strings.TrimSpace(m.fProcessName),
+		}
+		infraTmpl += " · " + effectiveHostName(svcForNames)
+		if infraUsesProcessName(m.fInfraTemplate) {
+			infraTmpl += "/" + effectiveProcessName(svcForNames)
+		}
 	}
 
 	return []string{
