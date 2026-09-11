@@ -5,9 +5,28 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
+
+func TestStartRequiresAPIToken(t *testing.T) {
+	t.Setenv(envToken, "")
+	app := NewApp(filepath.Join(t.TempDir(), "config.json"), 0)
+	app.cfg = normalizeConfig(Config{
+		Endpoint: "https://example.live.dynatrace.com/api/v2/otlp",
+		Services: []Service{{Name: "svc", Enabled: true}},
+	})
+
+	err := app.Start()
+	if err == nil || !strings.Contains(err.Error(), "API token is required") {
+		t.Fatalf("Start error = %v, want missing-token error", err)
+	}
+	if app.GetStatus().Running {
+		t.Fatal("app started without an API token")
+	}
+}
 
 func TestSendServicePostsOnePayloadPerEnabledSignal(t *testing.T) {
 	var mu sync.Mutex

@@ -69,8 +69,30 @@ func TestMetricAndSeverityNormalizeCase(t *testing.T) {
 	if err := validateConfig(cfg); err != nil {
 		t.Fatalf("normalized config rejected: %v", err)
 	}
-	if cfg.Services[0].Metric.Type != "histogram" || cfg.Services[0].LogSeverity != "warn" {
+	if len(cfg.Services[0].Metrics) != 1 || cfg.Services[0].Metrics[0].Type != "histogram" || cfg.Services[0].LogSeverity != "warn" {
 		t.Fatalf("normalization = %+v", cfg.Services[0])
+	}
+	if cfg.Services[0].Metric != nil {
+		t.Fatal("legacy metric field was not cleared after migration")
+	}
+}
+
+func TestLegacyMetricJSONMigratesToMetrics(t *testing.T) {
+	var svc Service
+	if err := json.Unmarshal([]byte(`{"name":"svc","metric":{"type":"gauge","name":"queue.depth","unit":"1"}}`), &svc); err != nil {
+		t.Fatalf("unmarshal legacy service: %v", err)
+	}
+	svc = normalizeService(svc)
+	if len(svc.Metrics) != 1 || svc.Metrics[0].Name != "queue.depth" || svc.Metrics[0].Type != "gauge" {
+		t.Fatalf("migrated metrics = %+v", svc.Metrics)
+	}
+
+	b, err := json.Marshal(svc)
+	if err != nil {
+		t.Fatalf("marshal migrated service: %v", err)
+	}
+	if strings.Contains(string(b), `"metric":`) || !strings.Contains(string(b), `"metrics":`) {
+		t.Fatalf("legacy metric field survived migration: %s", b)
 	}
 }
 

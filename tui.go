@@ -42,16 +42,23 @@ const (
 )
 
 const (
-	tabService = iota
-	tabSpans
-	tabCalls
-	tabInfrastructure
-	tabMetricsLogs
-	tabResourceAttrs
-	tabSpanAttrs
+	tabBasics = iota
+	tabEnvironment
+	tabTrace
+	tabSignalDetails
+	tabAdvanced
 )
 
-var serviceTabNames = []string{"Service", "Spans", "Calls", "Infrastructure", "Metrics & logs", "Resource attrs", "Span attrs"}
+// Compatibility aliases keep the established names usable in focused tests
+// while the visible information architecture stays task-oriented.
+const (
+	tabService        = tabBasics
+	tabSpans          = tabTrace
+	tabMetricsLogs    = tabSignalDetails
+	tabInfrastructure = tabEnvironment
+)
+
+var serviceTabNames = []string{"Basics", "Environment", "Trace scenario", "Signal details", "Advanced"}
 
 // ── model ─────────────────────────────────────────────────────────────────────
 
@@ -64,39 +71,50 @@ type tui struct {
 
 	screen tuiScreen
 	cursor int
-	cfg    Config
-	status RuntimeStatus
+	// listOffset is the first rendered service. It keeps cursor navigation
+	// inside the terminal instead of allowing longer scenarios to overflow.
+	listOffset int
+	cfg        Config
+	status     RuntimeStatus
 
 	form *huh.Form
 
 	// service editor state
-	editIdx   int     // index in cfg.Services; -1 = new service
-	editTab   int     // active tab
-	tabActive bool    // true = tab selector focused; false = huh form focused
-	origSvc   Service // snapshot used for unsaved-change detection
+	editIdx           int     // index in cfg.Services; -1 = new service
+	editTab           int     // active tab
+	tabActive         bool    // true = tab selector focused; false = huh form focused
+	origSvc           Service // snapshot used for unsaved-change detection
+	traceStep         int     // 0 = trace menu, 1 = span shape, 2 = downstream calls
+	traceTarget       string  // "spans" | "calls"
+	environmentStep   int     // 0 = environment menu, 1 = selected option
+	environmentTarget string  // "infrastructure" | "mesh"
+	advancedStep      int     // 0 = advanced menu, 1 = selected attribute editor
+	advancedTarget    string  // "resource" | "span" | "preview"
+	editorError       string  // persistent until the next successful save
 
 	// bound form fields – service editor
-	fName          string
-	fTemplate      string
-	fInfraCategory string // "" | "kubernetes" | "container" | "serverless" | "host" | "other"
-	fInfraTemplate string
-	fInfraStep     int // 0 = category select, 1 = template select, 2 = host/process name
-	fHostName      string
-	fProcessName   string
-	fSpanKind      string
-	fFailure       string
-	fInterval      string
-	fChildSpans    string
-	fSignals       []string
-	fDownstream    []string
-	fMetricType    string
-	fMetricName    string
-	fMetricUnit    string
-	fLogSeverity   string
-	fMesh          bool
-	fEnabled       bool
-	fAttrs         string
-	fSpanAttrs     string
+	fName           string
+	fTemplate       string
+	fInfraCategory  string // "" | "kubernetes" | "container" | "serverless" | "host" | "other"
+	fInfraTemplate  string
+	fInfraStep      int // 0 = category select, 1 = template select, 2 = host/process name
+	fHostName       string
+	fProcessName    string
+	fSpanKind       string
+	fFailure        string
+	fInterval       string
+	fChildSpans     string
+	fSignals        []string
+	fDownstream     []string
+	fMetrics        string // complete editable metric rows
+	fMetricsDefault string // non-empty while fMetrics is the generated default row
+	fLog            string // "severity | message"; blank keeps generated INFO default
+	fMesh           bool
+	fEnabled        bool
+	fAttrs          string
+	fResourceAttrs  string // effective resource attributes while that editor is open
+	fSpanAttrs      string // stored additions/replacements
+	fSpanAttrsEdit  string // effective template + service attributes while editing
 
 	fDeleteConfirmed  bool
 	fDiscardConfirmed bool
@@ -105,6 +123,7 @@ type tui struct {
 	gEndpoint string
 	gToken    string
 	gAttrs    string
+	firstRun  bool
 
 	testing    bool
 	spinnerIdx int // advances on each tick while testing == true
@@ -123,12 +142,14 @@ type tui struct {
 }
 
 func NewTUIModel(app *App) *tui {
-	return &tui{
+	m := &tui{
 		app:     app,
 		cfg:     app.GetConfig(),
 		status:  app.GetStatus(),
 		editIdx: -1,
 	}
+	m.firstRun = strings.TrimSpace(m.cfg.runtimeConfig().Endpoint) == ""
+	return m
 }
 
 // ── tea.Model ─────────────────────────────────────────────────────────────────
@@ -141,11 +162,17 @@ func (m *tui) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.ensureCursorVisible()
+		if m.firstRun {
+			m.firstRun = false
+			return m.openGlobalForm()
+		}
 		return m, nil
 
 	case tickMsg:
 		m.cfg = m.app.GetConfig()
 		m.status = m.app.GetStatus()
+		m.ensureCursorVisible()
 		if m.testing {
 			m.spinnerIdx = (m.spinnerIdx + 1) % len(spinnerFrames)
 		}
@@ -211,6 +238,12 @@ func (m *tui) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if k.Type == tea.KeyEsc {
 			return m.leaveForm()
 		}
+		if m.screen == screenGlobal && k.String() == "ctrl+t" {
+			return m.commitGlobalAndTest()
+		}
+		if m.screen == screenServiceEdit && k.String() == "ctrl+s" {
+			return m.commitService()
+		}
 	}
 
 	newModel, cmd := m.form.Update(msg)
@@ -229,20 +262,40 @@ func (m *tui) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 // leaveForm handles Esc / abort out of an open form.
 func (m *tui) leaveForm() (tea.Model, tea.Cmd) {
 	if m.screen == screenServiceEdit {
+		if m.editTab == tabTrace && m.traceStep > 0 {
+			m.traceStep = 0
+			m.form = m.makeServiceTabForm(tabTrace)
+			return m, m.form.Init()
+		}
 		if m.editTab == tabInfrastructure {
-			// ESC walks back through infra steps: 2→1→0→tab selector.
-			if m.fInfraStep == 2 {
-				m.fInfraStep = 1
-				m.form = m.makeServiceTabForm(tabInfrastructure)
-				return m, m.form.Init()
-			}
-			if m.fInfraStep == 1 {
-				m.fInfraStep = 0
+			if m.environmentStep > 0 {
+				// Inside Infrastructure, Esc walks name → template → category.
+				if m.environmentTarget == "infrastructure" && m.fInfraStep > 0 {
+					m.fInfraStep--
+					m.form = m.makeServiceTabForm(tabInfrastructure)
+					return m, m.form.Init()
+				}
+				// Category and Istio both return to the Environment menu.
+				m.environmentStep = 0
 				m.form = m.makeServiceTabForm(tabInfrastructure)
 				return m, m.form.Init()
 			}
 		}
+		if m.editTab == tabAdvanced && m.advancedStep == 1 {
+			switch m.advancedTarget {
+			case "resource":
+				m.syncResourceAttrsEditor()
+			case "span":
+				m.syncSpanAttrsEditor()
+			}
+			m.advancedStep = 0
+			m.form = m.makeServiceTabForm(tabAdvanced)
+			return m, m.form.Init()
+		}
+		m.traceStep = 0
+		m.environmentStep = 0
 		m.fInfraStep = 0
+		m.advancedStep = 0
 		m.tabActive = true
 	} else {
 		m.screen = screenList
@@ -254,8 +307,35 @@ func (m *tui) leaveForm() (tea.Model, tea.Cmd) {
 func (m *tui) commitForm() (tea.Model, tea.Cmd) {
 	switch m.screen {
 	case screenServiceEdit:
-		// Infrastructure tab is a multi-step flow: category → template → name(s).
+		if m.editTab == tabTrace {
+			if m.traceStep == 0 {
+				m.traceStep = 1
+				if m.traceTarget == "calls" && m.hasDownstreamChoices() {
+					m.traceStep = 2
+				}
+				m.form = m.makeServiceTabForm(tabTrace)
+				return m, m.form.Init()
+			}
+			m.traceStep = 0
+			m.tabActive = true
+			m.form = nil
+			return m, nil
+		}
+		// Environment first chooses Infrastructure or Istio. The infrastructure
+		// path itself remains category → template → optional identity names.
 		if m.editTab == tabInfrastructure {
+			if m.environmentStep == 0 {
+				m.environmentStep = 1
+				m.fInfraStep = 0
+				m.form = m.makeServiceTabForm(tabInfrastructure)
+				return m, m.form.Init()
+			}
+			if m.environmentTarget == "mesh" {
+				m.environmentStep = 0
+				m.tabActive = true
+				m.form = nil
+				return m, nil
+			}
 			if m.fInfraStep == 0 {
 				if m.fInfraCategory == "" {
 					// "None" chosen — clear template and return.
@@ -264,6 +344,11 @@ func (m *tui) commitForm() (tea.Model, tea.Cmd) {
 					m.tabActive = true
 					m.form = nil
 					return m, nil
+				}
+				// A template from the previously selected category is not a
+				// valid default in the newly selected category.
+				if infraCategoryOf[m.fInfraTemplate] != m.fInfraCategory {
+					m.fInfraTemplate = ""
 				}
 				m.fInfraStep = 1
 				m.form = m.makeServiceTabForm(tabInfrastructure)
@@ -275,8 +360,39 @@ func (m *tui) commitForm() (tea.Model, tea.Cmd) {
 				return m, m.form.Init()
 			}
 		}
+		if m.editTab == tabAdvanced {
+			if m.advancedStep == 0 {
+				if m.advancedTarget == "preview" {
+					m.form = nil
+					m.tabActive = true
+					return m.openPayloadPreview()
+				}
+				switch m.advancedTarget {
+				case "resource":
+					m.prepareResourceAttrsEditor()
+				case "span":
+					m.prepareSpanAttrsEditor()
+				}
+				m.advancedStep = 1
+				m.form = m.makeServiceTabForm(tabAdvanced)
+				return m, m.form.Init()
+			}
+			switch m.advancedTarget {
+			case "resource":
+				m.syncResourceAttrsEditor()
+			case "span":
+				m.syncSpanAttrsEditor()
+			}
+			m.advancedStep = 0
+			m.tabActive = true
+			m.form = nil
+			return m, nil
+		}
 		// All other tabs (and infra steps 1 without name step, or step 2): return to selector.
+		m.traceStep = 0
+		m.environmentStep = 0
 		m.fInfraStep = 0
+		m.advancedStep = 0
 		m.tabActive = true
 		m.form = nil
 		return m, nil
@@ -306,11 +422,33 @@ func (m *tui) updateList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
+			m.ensureCursorVisible()
 		}
 
 	case "down", "j":
 		if m.cursor < len(svcs)-1 {
 			m.cursor++
+			m.ensureCursorVisible()
+		}
+
+	case "pgup":
+		m.cursor = max(0, m.cursor-m.serviceListCapacity())
+		m.ensureCursorVisible()
+
+	case "pgdown":
+		if len(svcs) > 0 {
+			m.cursor = min(len(svcs)-1, m.cursor+m.serviceListCapacity())
+			m.ensureCursorVisible()
+		}
+
+	case "home":
+		m.cursor = 0
+		m.ensureCursorVisible()
+
+	case "end":
+		if len(svcs) > 0 {
+			m.cursor = len(svcs) - 1
+			m.ensureCursorVisible()
 		}
 
 	case "n":
@@ -349,22 +487,20 @@ func (m *tui) updateList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.testing {
 			return m, nil
 		}
+		if strings.TrimSpace(m.cfg.runtimeConfig().Endpoint) == "" {
+			return m.openGlobalForm()
+		}
 		m.testing = true
 		m.spinnerIdx = 0
 		return m, testConnCmd(m.app)
 
-	case "ctrl+q":
+	case "p", "ctrl+q":
 		if len(svcs) > 0 {
 			return m.openPayloadPreview()
 		}
 
-	case "g":
-		m.gEndpoint = m.cfg.Endpoint
-		m.gToken = m.cfg.Token
-		m.gAttrs = attrsToText(m.cfg.Attributes)
-		m.screen = screenGlobal
-		m.form = m.makeGlobalForm()
-		return m, m.form.Init()
+	case "c", "g":
+		return m.openGlobalForm()
 
 	case "?":
 		m.screen = screenHelp
@@ -377,6 +513,14 @@ func (m *tui) updateList(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *tui) loadServiceFields(idx int) {
 	m.editIdx = idx
+	m.traceStep = 0
+	m.traceTarget = "spans"
+	m.environmentStep = 0
+	m.environmentTarget = "infrastructure"
+	m.fInfraStep = 0
+	m.advancedStep = 0
+	m.advancedTarget = "resource"
+	m.editorError = ""
 	if idx == -1 {
 		m.fName = defaultServiceNamePrefix
 		m.fTemplate = ""
@@ -390,10 +534,9 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fChildSpans = "0"
 		m.fSignals = []string{"logs", "metrics", "spans"}
 		m.fDownstream = nil
-		m.fMetricType = "sum"
-		m.fMetricName = ""
-		m.fMetricUnit = ""
-		m.fLogSeverity = "info"
+		m.fMetrics = defaultMetricExample(m.fName)
+		m.fMetricsDefault = m.fMetrics
+		m.fLog = ""
 		m.fMesh = false
 		m.fEnabled = true
 		m.fAttrs = ""
@@ -417,21 +560,21 @@ func (m *tui) loadServiceFields(idx int) {
 			sort.Strings(m.fSignals)
 		}
 		m.fDownstream = append([]string(nil), svc.DownstreamCalls...)
-		effectiveMetric := effectiveMetricConfig(svc)
-		m.fMetricType = effectiveMetric.Type
-		m.fMetricName = ""
-		m.fMetricUnit = ""
-		if svc.Metric != nil {
-			m.fMetricName = svc.Metric.Name
-			m.fMetricUnit = svc.Metric.Unit
+		m.fMetrics = metricsToText(svc)
+		m.fMetricsDefault = ""
+		if len(svc.Metrics) == 0 && svc.Metric == nil {
+			m.fMetrics = defaultMetricExample(svc.Name)
+			m.fMetricsDefault = m.fMetrics
 		}
-		m.fLogSeverity = effectiveLogSeverity(svc)
+		m.fLog = logToText(svc)
 		m.fMesh = svc.Mesh
 		m.fEnabled = svc.Enabled
 
 		m.fAttrs = attrsToText(svc.Attributes)
 		m.fSpanAttrs = attrsToText(svc.SpanAttrs)
 	}
+	m.fResourceAttrs = ""
+	m.fSpanAttrsEdit = ""
 	m.origSvc = m.buildServiceFromFields()
 }
 
@@ -446,16 +589,12 @@ func (m *tui) buildServiceFromFields() Service {
 	if len(signals) == 3 {
 		signals = nil // all three = store empty (= all enabled)
 	}
-	metricConfig := MetricConfig{
-		Type: strings.TrimSpace(m.fMetricType),
-		Name: strings.TrimSpace(m.fMetricName),
-		Unit: strings.TrimSpace(m.fMetricUnit),
+	metricsText := m.fMetrics
+	if m.fMetricsDefault != "" && strings.TrimSpace(metricsText) == strings.TrimSpace(m.fMetricsDefault) {
+		metricsText = ""
 	}
-	var metric *MetricConfig
-	if !(metricConfig.Type == "sum" && metricConfig.Name == "" && metricConfig.Unit == "") {
-		metric = &metricConfig
-	}
-	severity := strings.TrimSpace(m.fLogSeverity)
+	metrics, _ := parseMetricsText(metricsText)
+	severity, logMessage, _ := parseLogText(m.fLog)
 	if severity == "info" {
 		severity = ""
 	}
@@ -472,8 +611,9 @@ func (m *tui) buildServiceFromFields() Service {
 		ChildSpans:      childSpans,
 		Signals:         signals,
 		DownstreamCalls: append([]string(nil), m.fDownstream...),
-		Metric:          metric,
+		Metrics:         metrics,
 		LogSeverity:     severity,
+		LogMessage:      logMessage,
 		Mesh:            m.fMesh,
 		Enabled:         m.fEnabled,
 		Attributes:      parseAttrs(m.fAttrs),
@@ -484,6 +624,151 @@ func (m *tui) buildServiceFromFields() Service {
 // hasUnsavedChanges reports whether the editor differs from the last saved state.
 func (m *tui) hasUnsavedChanges() bool {
 	return !reflect.DeepEqual(m.buildServiceFromFields(), m.origSvc)
+}
+
+func signalEnabled(signals []string, want string) bool {
+	for _, signal := range signals {
+		if strings.EqualFold(signal, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseMetricsText(text string) ([]MetricConfig, error) {
+	var metrics []MetricConfig
+	lineNumber := 0
+	for _, raw := range strings.Split(text, "\n") {
+		lineNumber++
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) == 1 {
+			parts = strings.Fields(line)
+		}
+		if len(parts) > 3 {
+			return nil, fmt.Errorf("metric line %d: use type | name | unit", lineNumber)
+		}
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		metric := MetricConfig{}
+		if len(parts) > 0 {
+			metric.Type = strings.ToLower(parts[0])
+		}
+		if len(parts) > 1 {
+			metric.Name = parts[1]
+		}
+		if len(parts) > 2 {
+			metric.Unit = parts[2]
+		}
+		switch metric.Type {
+		case "", "sum", "gauge", "histogram":
+		default:
+			return nil, fmt.Errorf("metric line %d: type must be sum, gauge, or histogram", lineNumber)
+		}
+		metrics = append(metrics, metric)
+	}
+	if len(metrics) == 0 {
+		// A blank editor accepts the complete example shown as its placeholder
+		// and retains the historical service-name-derived sum metric.
+		return []MetricConfig{{}}, nil
+	}
+	return metrics, nil
+}
+
+func metricsToText(svc Service) string {
+	metrics := append([]MetricConfig(nil), svc.Metrics...)
+	if len(metrics) == 0 && svc.Metric != nil {
+		metrics = append(metrics, *svc.Metric)
+	}
+	if len(metrics) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(metrics))
+	for _, metric := range metrics {
+		parts := []string{metric.Type, metric.Name, metric.Unit}
+		last := len(parts) - 1
+		for last > 0 && strings.TrimSpace(parts[last]) == "" {
+			last--
+		}
+		lines = append(lines, strings.Join(parts[:last+1], " | "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func defaultMetricExample(serviceName string) string {
+	name := strings.TrimSpace(serviceName)
+	if name == "" || name == defaultServiceNamePrefix {
+		name = "otgen-service"
+	}
+	metric := effectiveMetricConfig(Service{Name: name})
+	return fmt.Sprintf("%s | %s | %s", metric.Type, metric.Name, metric.Unit)
+}
+
+func (m *tui) refreshDefaultMetricExample() {
+	if m.fMetricsDefault == "" || strings.TrimSpace(m.fMetrics) != strings.TrimSpace(m.fMetricsDefault) {
+		return
+	}
+	m.fMetricsDefault = defaultMetricExample(m.fName)
+	m.fMetrics = m.fMetricsDefault
+}
+
+func parseLogText(text string) (severity, message string, err error) {
+	line := strings.TrimSpace(text)
+	if line == "" {
+		return "info", "", nil
+	}
+	parts := strings.SplitN(line, "|", 2)
+	first := strings.ToLower(strings.TrimSpace(parts[0]))
+	validSeverity := first == "debug" || first == "info" || first == "warn" || first == "error"
+	if len(parts) == 1 {
+		if validSeverity {
+			return first, "", nil
+		}
+		// A message on its own is the fastest common path; INFO is implied.
+		return "info", line, nil
+	}
+	if first == "" {
+		first = "info"
+		validSeverity = true
+	}
+	message = strings.TrimSpace(parts[1])
+	if !validSeverity {
+		return first, message, fmt.Errorf("log severity must be DEBUG, INFO, WARN, or ERROR")
+	}
+	return first, message, nil
+}
+
+func logToText(svc Service) string {
+	severity := effectiveLogSeverity(svc)
+	message := strings.TrimSpace(svc.LogMessage)
+	if severity == "info" && message == "" {
+		return ""
+	}
+	if message == "" {
+		return strings.ToUpper(severity)
+	}
+	return strings.ToUpper(severity) + " | " + message
+}
+
+func defaultLogExample(serviceName string) string {
+	name := strings.TrimSpace(serviceName)
+	if name == "" || name == defaultServiceNamePrefix {
+		name = "otgen-service"
+	}
+	return "INFO | " + name + " synthetic log"
+}
+
+func (m *tui) hasDownstreamChoices() bool {
+	for i := range m.cfg.Services {
+		if i != m.editIdx {
+			return true
+		}
+	}
+	return false
 }
 
 // ── service editor: forms ─────────────────────────────────────────────────────
@@ -551,12 +836,8 @@ func infraTemplatesForCategory(cat string) []huh.Option[string] {
 
 func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 	w := m.formWidth()
-	metricPreview := effectiveMetricConfig(Service{
-		Name:   strings.TrimSpace(m.fName),
-		Metric: &MetricConfig{Type: m.fMetricType, Name: m.fMetricName, Unit: m.fMetricUnit},
-	})
 	switch tabIdx {
-	case tabService:
+	case tabBasics:
 		return huh.NewForm(
 			huh.NewGroup(
 				huh.NewInput().
@@ -599,16 +880,62 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 						huh.NewOption("logs", "logs"),
 					).
 					Value(&m.fSignals),
-				huh.NewConfirm().
-					Title(settingsLabel("Istio mesh")).
-					Inline(true).
-					Affirmative("on").
-					Negative("off").
-					Value(&m.fMesh),
 			),
 		).WithWidth(w)
 
-	case tabSpans:
+	case tabTrace:
+		if !signalEnabled(m.fSignals, "spans") {
+			return huh.NewForm(
+				huh.NewGroup(
+					huh.NewNote().
+						Title("Trace scenario unavailable").
+						Description("Enable Spans in Basics to configure trace generation."),
+				),
+			).WithWidth(w)
+		}
+		if m.traceStep == 0 {
+			traceOptions := []huh.Option[string]{
+				huh.NewOption("Span shape", "spans"),
+			}
+			if m.hasDownstreamChoices() {
+				traceOptions = append(traceOptions, huh.NewOption("Downstream calls", "calls"))
+			}
+			return huh.NewForm(
+				huh.NewGroup(
+					huh.NewSelect[string]().
+						Title("Trace scenario").
+						Description("Configure span shape or service relationships").
+						Options(traceOptions...).
+						Value(&m.traceTarget),
+				),
+			).WithWidth(w)
+		}
+		if m.traceStep == 2 {
+			var callOpts []huh.Option[string]
+			for i, svc := range m.cfg.Services {
+				if i != m.editIdx {
+					callOpts = append(callOpts, huh.NewOption(svc.Name, svc.Name))
+				}
+			}
+			if len(callOpts) == 0 {
+				return huh.NewForm(
+					huh.NewGroup(
+						huh.NewNote().
+							Title("Downstream calls").
+							Description("No other services configured yet."),
+					),
+				).WithWidth(w)
+			}
+			return huh.NewForm(
+				huh.NewGroup(
+					huh.NewMultiSelect[string]().
+						Title("Downstream calls").
+						Description("Services this one calls · space to toggle").
+						Options(callOpts...).
+						Value(&m.fDownstream),
+				),
+			).WithWidth(w)
+		}
 		return huh.NewForm(
 			huh.NewGroup(
 				huh.NewSelect[string]().
@@ -649,70 +976,37 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 			),
 		).WithWidth(w)
 
-	case tabCalls:
-		var callOpts []huh.Option[string]
-		for i, svc := range m.cfg.Services {
-			if i != m.editIdx {
-				callOpts = append(callOpts, huh.NewOption(svc.Name, svc.Name))
-			}
-		}
-		if len(callOpts) == 0 {
-			return huh.NewForm(
-				huh.NewGroup(
-					huh.NewNote().
-						Title("Downstream calls").
-						Description("No other services configured yet.\nAdd more services to set up call chains."),
-				),
-			).WithWidth(w)
-		}
-		return huh.NewForm(
-			huh.NewGroup(
-				huh.NewMultiSelect[string]().
-					Title("Downstream calls").
-					Description("Services this one calls · space to toggle").
-					Options(callOpts...).
-					Value(&m.fDownstream),
-			),
-		).WithWidth(w)
-
 	case tabMetricsLogs:
+		m.refreshDefaultMetricExample()
 		metricsNote, _ := inheritedMetricsNote(Service{
 			Name:          strings.TrimSpace(m.fName),
 			InfraTemplate: m.fInfraTemplate,
 			Mesh:          m.fMesh,
 		}, w-4, max(2, m.textLines()-8))
-		metricFields := []huh.Field{
-			huh.NewSelect[string]().
-				Title(settingsLabel("Metric type")).
-				Inline(true).
-				Options(
-					huh.NewOption("Sum", "sum"),
-					huh.NewOption("Gauge", "gauge"),
-					huh.NewOption("Histogram", "histogram"),
-				).
-				Description("Used when metrics are enabled").
-				Value(&m.fMetricType),
-			huh.NewInput().
-				Title(settingsLabel("Metric name")).
-				Inline(true).
-				Placeholder(metricPreview.Name).
-				Value(&m.fMetricName),
-			huh.NewInput().
-				Title(settingsLabel("Metric unit")).
-				Inline(true).
-				Placeholder(metricPreview.Unit).
-				Value(&m.fMetricUnit),
-			huh.NewSelect[string]().
-				Title(settingsLabel("Log severity")).
-				Inline(true).
-				Options(
-					huh.NewOption("DEBUG", "debug"),
-					huh.NewOption("INFO", "info"),
-					huh.NewOption("WARN", "warn"),
-					huh.NewOption("ERROR", "error"),
-				).
-				Description("Used when logs are enabled").
-				Value(&m.fLogSeverity),
+		signalFields := []huh.Field{}
+		if signalEnabled(m.fSignals, "metrics") {
+			metricLines := min(7, max(3, m.textLines()-4))
+			if signalEnabled(m.fSignals, "logs") {
+				metricLines = min(metricLines, 4)
+			}
+			signalFields = append(signalFields, huh.NewText().
+				Title("Metrics").
+				Description("one per line: type | name | unit · blank uses the example shown").
+				Placeholder(defaultMetricExample(m.fName)).
+				Lines(metricLines).
+				Value(&m.fMetrics))
+		}
+		if signalEnabled(m.fSignals, "logs") {
+			signalFields = append(signalFields, huh.NewInput().
+				Title("Log").
+				Description("SEVERITY | message · or enter only a message for INFO").
+				Placeholder(defaultLogExample(m.fName)).
+				Value(&m.fLog))
+		}
+		if len(signalFields) == 0 {
+			signalFields = append(signalFields, huh.NewNote().
+				Title("No metric or log settings").
+				Description("Enable Metrics or Logs in Basics to configure them here."))
 		}
 		// Read-only context goes last, so the editable fields stay at the top
 		// of the tab where the cursor lands.
@@ -720,16 +1014,43 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 		// On a short terminal it is dropped entirely: the four editable fields
 		// already fill ~16 rows and a huh Note costs several more in chrome
 		// alone, and huh cannot scroll a group that overflows. The tab summary
-		// still shows the count, and ctrl+q still lists every series.
-		if metricsNote != "" && m.textLines() >= 10 {
-			metricFields = append(metricFields, huh.NewNote().
+		// still shows the count, and the payload preview still lists every series.
+		if signalEnabled(m.fSignals, "metrics") && metricsNote != "" && m.height >= 30 {
+			signalFields = append(signalFields, huh.NewNote().
 				Title("Also emitted (read-only)").
 				Description(metricsNote))
 		}
-		return huh.NewForm(huh.NewGroup(metricFields...)).WithWidth(w)
+		return huh.NewForm(huh.NewGroup(signalFields...)).WithWidth(w)
 
 	case tabInfrastructure:
-		// Two-step flow: category first, then the template within that category.
+		if m.environmentStep == 0 {
+			return huh.NewForm(
+				huh.NewGroup(
+					huh.NewSelect[string]().
+						Title("Environment").
+						Description("Configure infrastructure or mesh independently").
+						Options(
+							huh.NewOption("Infrastructure", "infrastructure"),
+							huh.NewOption("Istio mesh telemetry", "mesh"),
+						).
+						Value(&m.environmentTarget),
+				),
+			).WithWidth(w)
+		}
+		if m.environmentTarget == "mesh" {
+			return huh.NewForm(
+				huh.NewGroup(
+					huh.NewConfirm().
+						Title("Istio mesh telemetry").
+						Description("Adds mesh attributes and standard Istio metrics").
+						Affirmative("on").
+						Negative("off").
+						Value(&m.fMesh),
+				),
+			).WithWidth(w)
+		}
+
+		// Infrastructure is category first, then the template within that category.
 		// Static Options() on both selects avoids huh v1's OptionsFunc viewport
 		// bug (YOffset pinned to selected on every Update → text scrolls, cursor
 		// stays put). commitForm() advances step 0→1; leaveForm() walks step 1→0.
@@ -780,42 +1101,49 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 		}
 		return huh.NewForm(huh.NewGroup(nameFields...)).WithWidth(w)
 
-	case tabResourceAttrs:
-		svcForNote := Service{
-			Name:          strings.TrimSpace(m.fName),
-			InfraTemplate: m.fInfraTemplate,
-			HostName:      strings.TrimSpace(m.fHostName),
-			ProcessName:   strings.TrimSpace(m.fProcessName),
-			Mesh:          m.fMesh,
+	case tabAdvanced:
+		if m.advancedStep == 0 {
+			advancedOptions := []huh.Option[string]{
+				huh.NewOption("Resource attributes", "resource"),
+			}
+			if signalEnabled(m.fSignals, "spans") {
+				advancedOptions = append(advancedOptions,
+					huh.NewOption("Span attributes", "span"))
+			}
+			advancedOptions = append(advancedOptions,
+				huh.NewOption("Payload preview", "preview"))
+			return huh.NewForm(
+				huh.NewGroup(
+					huh.NewSelect[string]().
+						Title("Advanced").
+						Description("Open only the detail you need").
+						Options(advancedOptions...).
+						Value(&m.advancedTarget),
+				),
+			).WithWidth(w)
 		}
-		resNote, resNoteLines := inheritedResAttrsNote(m.cfg, svcForNote, w-4)
-		var resFields []huh.Field
-		if resNote != "" {
-			resFields = append(resFields, huh.NewNote().
-				Title("Inherited (read-only)").
-				Description(resNote))
+		if m.advancedTarget == "resource" {
+			return huh.NewForm(huh.NewGroup(
+				huh.NewText().
+					Title("Effective resource attributes").
+					Description("Edit inherited values or add keys · only differences are saved · service.name comes from Basics").
+					Lines(m.textLines()).
+					Value(&m.fResourceAttrs),
+			)).WithWidth(w)
 		}
-		resFields = append(resFields, huh.NewText().
-			Title("Resource attribute overrides").
-			Description(attrTypeHint).
-			Lines(max(1, m.textLines()-max(0, resNoteLines+3))).
-			Value(&m.fAttrs))
-		return huh.NewForm(huh.NewGroup(resFields...)).WithWidth(w)
 
-	default: // tabSpanAttrs
-		spanNote, spanNoteLines := inheritedSpanAttrsNote(m.fTemplate, w-4)
-		var spanFields []huh.Field
-		if spanNote != "" {
-			spanFields = append(spanFields, huh.NewNote().
-				Title("From template (read-only)").
-				Description(spanNote))
-		}
-		spanFields = append(spanFields, huh.NewText().
-			Title("Span attribute overrides").
-			Description(attrTypeHint).
-			Lines(max(1, m.textLines()-max(0, spanNoteLines+3))).
-			Value(&m.fSpanAttrs))
-		return huh.NewForm(huh.NewGroup(spanFields...)).WithWidth(w)
+		// Span attributes are the remaining editable advanced target. Payload
+		// preview is handled before this form is built in commitForm.
+		return huh.NewForm(huh.NewGroup(
+			huh.NewText().
+				Title("Span attributes — generated sample").
+				Description("Edit any generated value or add keys · only differences are saved · " + attrTypeHint).
+				Lines(m.textLines()).
+				Value(&m.fSpanAttrsEdit),
+		)).WithWidth(w)
+
+	default:
+		return huh.NewForm(huh.NewGroup(huh.NewNote().Title("Unknown section"))).WithWidth(w)
 	}
 }
 
@@ -824,28 +1152,177 @@ func settingsLabel(s string) string {
 	return fmt.Sprintf("%-22s", s)
 }
 
-// resetInfraStepIfNeeded resets the infrastructure two-step flow to step 0
-// and re-derives fInfraCategory from the actual saved template whenever the
-// infra tab is opened from the tab selector, so stale UI state is discarded.
-func (m *tui) resetInfraStepIfNeeded() {
+// resetEditorSubflow returns nested sections to their overview whenever a
+// section is opened from the selector, so stale focus state is never reused.
+func (m *tui) resetEditorSubflow() {
+	m.traceStep = 0
+	m.traceTarget = "spans"
+	m.environmentStep = 0
+	m.environmentTarget = "infrastructure"
+	m.advancedStep = 0
+	m.advancedTarget = "resource"
 	if m.editTab == tabInfrastructure {
 		m.fInfraStep = 0
 		m.fInfraCategory = infraCategoryOf[m.fInfraTemplate]
 	}
 }
 
+func (m *tui) resourceInheritanceService() Service {
+	return Service{
+		Name:          strings.TrimSpace(m.fName),
+		InfraTemplate: m.fInfraTemplate,
+		HostName:      strings.TrimSpace(m.fHostName),
+		ProcessName:   strings.TrimSpace(m.fProcessName),
+		Mesh:          m.fMesh,
+	}
+}
+
+func (m *tui) spanInheritanceService() Service {
+	return Service{
+		Name:     strings.TrimSpace(m.fName),
+		Template: m.fTemplate,
+		SpanKind: m.fSpanKind,
+		Mesh:     m.fMesh,
+	}
+}
+
+func (m *tui) prepareResourceAttrsEditor() {
+	effective := inheritedResourceAttrs(m.cfg, m.resourceInheritanceService())
+	mergeAttrs(effective, parseAttrs(m.fAttrs))
+	delete(effective, "service.name")
+	m.fResourceAttrs = attrsToText(effective)
+}
+
+func (m *tui) syncResourceAttrsEditor() {
+	inherited := inheritedResourceAttrs(m.cfg, m.resourceInheritanceService())
+	edited := parseAttrs(m.fResourceAttrs)
+	overrides := make(map[string]AttrValue)
+	for key, value := range edited {
+		if key == "service.name" {
+			continue
+		}
+		base, exists := inherited[key]
+		if !exists || base != value {
+			overrides[key] = value
+		}
+	}
+	m.fAttrs = attrsToText(overrides)
+}
+
+func (m *tui) prepareSpanAttrsEditor() {
+	effective := inheritedSpanAttrs(m.spanInheritanceService())
+	mergeAttrs(effective, parseAttrs(m.fSpanAttrs))
+	m.fSpanAttrsEdit = attrsToText(effective)
+}
+
+func (m *tui) syncSpanAttrsEditor() {
+	inherited := inheritedSpanAttrs(m.spanInheritanceService())
+	edited := parseAttrs(m.fSpanAttrsEdit)
+	overrides := make(map[string]AttrValue)
+	for key, value := range edited {
+		base, exists := inherited[key]
+		if !exists || base != value {
+			overrides[key] = value
+		}
+	}
+	m.fSpanAttrs = attrsToText(overrides)
+}
+
+func (m *tui) validateEditorFields() error {
+	if strings.TrimSpace(m.fName) == "" {
+		return fmt.Errorf("service name is required")
+	}
+	interval, err := strconv.Atoi(strings.TrimSpace(m.fInterval))
+	if err != nil || interval < 1 {
+		return fmt.Errorf("interval must be a whole number of at least 1 second")
+	}
+	failure, err := strconv.Atoi(strings.TrimSpace(m.fFailure))
+	if err != nil || failure < 0 || failure > 100 {
+		return fmt.Errorf("failure rate must be a whole number from 0 to 100")
+	}
+	children, err := strconv.Atoi(strings.TrimSpace(m.fChildSpans))
+	if err != nil || children < 0 || children > 10 {
+		return fmt.Errorf("local child spans must be a whole number from 0 to 10")
+	}
+	if len(m.fSignals) == 0 {
+		return fmt.Errorf("select at least one signal")
+	}
+	if signalEnabled(m.fSignals, "metrics") {
+		metrics, err := parseMetricsText(m.fMetrics)
+		if err != nil {
+			return err
+		}
+		seenNames := make(map[string]struct{}, len(metrics))
+		for i, metric := range effectiveMetricConfigs(Service{Name: strings.TrimSpace(m.fName), Metrics: metrics}) {
+			if _, duplicate := seenNames[metric.Name]; duplicate {
+				return fmt.Errorf("metric line %d: duplicate metric name %q", i+1, metric.Name)
+			}
+			seenNames[metric.Name] = struct{}{}
+		}
+	}
+	if signalEnabled(m.fSignals, "logs") {
+		if _, _, err := parseLogText(m.fLog); err != nil {
+			return err
+		}
+	}
+	if m.fInfraCategory != "" && infraCategoryOf[m.fInfraTemplate] != m.fInfraCategory {
+		return fmt.Errorf("choose an infrastructure template for the selected environment")
+	}
+	return nil
+}
+
+func validationTab(err error) int {
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "downstream"), strings.Contains(message, "call cycle"):
+		return tabTrace
+	case strings.Contains(message, "environment"), strings.Contains(message, "infrastructure"):
+		return tabEnvironment
+	case strings.Contains(message, "metric"), strings.Contains(message, "severity"):
+		return tabSignalDetails
+	default:
+		return tabBasics
+	}
+}
+
+func (m *tui) showEditorError(err error) (tea.Model, tea.Cmd) {
+	m.editorError = err.Error()
+	m.editTab = validationTab(err)
+	m.resetEditorSubflow()
+	m.tabActive = true
+	m.form = nil
+	return m, nil
+}
+
 func (m *tui) commitService() (tea.Model, tea.Cmd) {
+	if m.editTab == tabAdvanced && !m.tabActive && m.advancedStep == 1 {
+		switch m.advancedTarget {
+		case "resource":
+			m.syncResourceAttrsEditor()
+		case "span":
+			m.syncSpanAttrsEditor()
+		}
+	}
+	// Selecting None is complete in itself. Clear a previously selected
+	// template even when Ctrl+S is pressed before the environment form exits.
+	if m.fInfraCategory == "" {
+		m.fInfraTemplate = ""
+	}
+	if err := m.validateEditorFields(); err != nil {
+		return m.showEditorError(err)
+	}
 	svc := m.buildServiceFromFields()
 
 	cfg := m.cfg
 	services := append([]Service(nil), cfg.Services...)
+	newIndex := m.editIdx
 	oldName := ""
 	if m.editIdx >= 0 && m.editIdx < len(services) {
 		oldName = services[m.editIdx].Name
 	}
 	if m.editIdx == -1 {
 		services = append(services, svc)
-		m.editIdx = len(services) - 1
+		newIndex = len(services) - 1
 	} else {
 		services[m.editIdx] = svc
 	}
@@ -855,21 +1332,17 @@ func (m *tui) commitService() (tea.Model, tea.Cmd) {
 	}
 	cfg = normalizeConfig(cfg)
 	if err := validateConfig(cfg); err != nil {
-		m.setFlash("error: "+err.Error(), true)
-		m.tabActive = true
-		m.form = nil
-		return m, nil
+		return m.showEditorError(err)
 	}
 
 	if err := m.app.SetConfig(cfg); err != nil {
-		m.setFlash("error: "+err.Error(), true)
-		m.tabActive = true
-		m.form = nil
-		return m, nil
+		return m.showEditorError(err)
 	}
 
 	m.cfg = cfg
+	m.editIdx = newIndex
 	m.origSvc = svc
+	m.editorError = ""
 	m.setFlash("saved "+svc.Name, false)
 
 	m.screen = screenList
@@ -894,7 +1367,7 @@ func (m *tui) updateServiceSelector(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tabActive = false
 		return m, nil
 
-	case "s":
+	case "s", "ctrl+s":
 		return m.commitService()
 
 	case "up", "k", "left", "h", "[":
@@ -907,18 +1380,18 @@ func (m *tui) updateServiceSelector(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.editTab++
 		}
 
-	case "ctrl+q":
+	case "p", "ctrl+q":
 		return m.openPayloadPreview()
 
-	case "1", "2", "3", "4", "5", "6", "7":
+	case "1", "2", "3", "4", "5":
 		m.editTab = int(k.Runes[0] - '1')
-		m.resetInfraStepIfNeeded()
+		m.resetEditorSubflow()
 		m.tabActive = false
 		m.form = m.makeServiceTabForm(m.editTab)
 		return m, m.form.Init()
 
 	case "enter", " ":
-		m.resetInfraStepIfNeeded()
+		m.resetEditorSubflow()
 		m.tabActive = false
 		m.form = m.makeServiceTabForm(m.editTab)
 		return m, m.form.Init()
@@ -928,16 +1401,22 @@ func (m *tui) updateServiceSelector(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // ── global config ─────────────────────────────────────────────────────────────
 
+func (m *tui) openGlobalForm() (tea.Model, tea.Cmd) {
+	m.gEndpoint = m.cfg.Endpoint
+	m.gToken = m.cfg.Token
+	m.gAttrs = attrsToText(m.cfg.Attributes)
+	m.screen = screenGlobal
+	m.form = m.makeGlobalForm()
+	return m, m.form.Init()
+}
+
 func (m *tui) makeGlobalForm() *huh.Form {
 	w := m.formWidth()
 	endpointDesc := "e.g. https://xxx.live.dynatrace.com/api/v2/otlp"
 	if endpointFromEnv() {
 		endpointDesc = "⚠ OTGEN_ENDPOINT is set — it overrides this value at runtime"
 	}
-	tokenDesc := "Edit or clear the saved token"
-	if !m.cfg.hasToken() {
-		tokenDesc = "Optional — leave blank if unused"
-	}
+	tokenDesc := "Required when you start sending; may be saved blank for now"
 	if tokenFromEnv() {
 		tokenDesc = "⚠ OTGEN_TOKEN is set — it overrides this value at runtime"
 	}
@@ -962,21 +1441,49 @@ func (m *tui) makeGlobalForm() *huh.Form {
 	).WithWidth(w)
 }
 
-func (m *tui) commitGlobal() (tea.Model, tea.Cmd) {
+func (m *tui) saveGlobalConfig() error {
 	cfg := m.cfg
 	cfg.Endpoint = strings.TrimSpace(m.gEndpoint)
 	cfg.Attributes = parseAttrs(m.gAttrs)
 	cfg.Token = strings.TrimSpace(m.gToken)
 
 	if err := m.app.SetConfig(cfg); err != nil {
+		return err
+	}
+	m.cfg = m.app.GetConfig()
+	return nil
+}
+
+func (m *tui) commitGlobal() (tea.Model, tea.Cmd) {
+	if err := m.saveGlobalConfig(); err != nil {
 		m.setFlash("error: "+err.Error(), true)
 	} else {
-		m.cfg = m.app.GetConfig()
 		m.setFlash("settings saved", false)
 	}
 	m.screen = screenList
 	m.form = nil
 	return m, nil
+}
+
+func (m *tui) commitGlobalAndTest() (tea.Model, tea.Cmd) {
+	if err := m.saveGlobalConfig(); err != nil {
+		m.setFlash("error: "+err.Error(), true)
+		m.screen = screenList
+		m.form = nil
+		return m, nil
+	}
+	if strings.TrimSpace(m.cfg.runtimeConfig().Endpoint) == "" {
+		m.setFlash("OTLP endpoint is required to test the connection", true)
+		m.screen = screenList
+		m.form = nil
+		return m, nil
+	}
+	m.setFlash("settings saved", false)
+	m.screen = screenList
+	m.form = nil
+	m.testing = true
+	m.spinnerIdx = 0
+	return m, testConnCmd(m.app)
 }
 
 // ── confirmations ─────────────────────────────────────────────────────────────
@@ -1024,6 +1531,7 @@ func (m *tui) commitDelete() (tea.Model, tea.Cmd) {
 			m.setFlash("error: "+err.Error(), true)
 		} else {
 			m.cfg = cfg
+			m.ensureCursorVisible()
 			m.setFlash("deleted "+name, false)
 		}
 	}
@@ -1036,7 +1544,7 @@ func (m *tui) openDiscardConfirm() (tea.Model, tea.Cmd) {
 		huh.NewGroup(
 			huh.NewConfirm().
 				Title("Discard unsaved changes to " + strings.TrimSpace(m.fName) + "?").
-				Description("Press s in the tab list to save instead.").
+				Description("Press Ctrl+S in the section list to save instead.").
 				Affirmative("Yes, discard").
 				Negative("Keep editing").
 				Value(&m.fDiscardConfirmed),
@@ -1084,6 +1592,15 @@ func (m *tui) toggleRunning() (tea.Model, tea.Cmd) {
 		m.app.Stop()
 		m.setFlash("stopped", false)
 	} else {
+		runtimeCfg := m.cfg.runtimeConfig()
+		if strings.TrimSpace(runtimeCfg.Endpoint) == "" {
+			m.setFlash("OTLP endpoint is required — press c to configure", true)
+			return m.openGlobalForm()
+		}
+		if strings.TrimSpace(runtimeCfg.Token) == "" {
+			m.setFlash("API token is required to start sending — press c to configure", true)
+			return m, nil
+		}
 		if err := m.app.Start(); err != nil {
 			m.setFlash("error: "+err.Error(), true)
 		} else {
@@ -1120,12 +1637,12 @@ func (m *tui) View() string {
 			return m.serviceSelectorView()
 		}
 		if m.form != nil {
-			return m.tabBar(m.editTab) + "\n" + sHelp.Render("  esc tab selector  ·  s save") + "\n" + m.form.View()
+			return m.tabBar(m.editTab) + "\n" + m.editorContextLine() + m.editorErrorView() + "\n" + m.form.View()
 		}
 
 	case screenGlobal:
 		if m.form != nil {
-			return "  " + sBold.Render("Global configuration") + "\n" + sHelp.Render("  esc cancel · enter save") + "\n" + m.form.View()
+			return "  " + sBold.Render("Connection & global defaults") + "\n" + sHelp.Render("  esc cancel · enter save · ctrl+t save & test") + "\n" + m.form.View()
 		}
 
 	}
@@ -1133,6 +1650,46 @@ func (m *tui) View() string {
 		return m.form.View()
 	}
 	return m.listView()
+}
+
+func (m *tui) editorContextLine() string {
+	name := strings.TrimSpace(m.fName)
+	if name == "" {
+		name = "new service"
+	}
+	context := name + "  ›  " + serviceTabNames[m.editTab]
+	switch m.editTab {
+	case tabTrace:
+		if m.traceStep == 1 {
+			context += "  ·  span shape"
+		} else if m.traceStep == 2 {
+			context += "  ·  downstream calls"
+		}
+	case tabInfrastructure:
+		if m.environmentStep == 1 {
+			if m.environmentTarget == "mesh" {
+				context += "  ·  istio mesh"
+			} else {
+				total := 2
+				if m.fInfraCategory == "host" {
+					total = 3
+				}
+				context += fmt.Sprintf("  ·  infrastructure %d/%d", m.fInfraStep+1, total)
+			}
+		}
+	case tabAdvanced:
+		if m.advancedStep == 1 {
+			context += "  ·  " + m.advancedTarget + " attributes"
+		}
+	}
+	return sHelp.Render("  " + context + "  ·  esc back  ·  ctrl+s save")
+}
+
+func (m *tui) editorErrorView() string {
+	if m.editorError == "" {
+		return ""
+	}
+	return "\n" + sError.Render("  ✗ "+truncate(m.editorError, max(20, m.width-6)))
 }
 
 // sepLine renders the single horizontal rule used across all screens.
@@ -1197,7 +1754,11 @@ func (m *tui) serviceSelectorView() string {
 	} else {
 		head += "  " + sMuted.Render("✓ saved")
 	}
-	rows = append(rows, head, "")
+	rows = append(rows, head)
+	if m.editorError != "" {
+		rows = append(rows, sError.Render("  ✗ "+truncate(m.editorError, max(20, m.width-6))))
+	}
+	rows = append(rows, "")
 
 	for i, tabName := range serviceTabNames {
 		line := fmt.Sprintf("%d %s", i+1, tabName)
@@ -1214,8 +1775,8 @@ func (m *tui) serviceSelectorView() string {
 	}
 
 	rows = append(rows, "", "  "+m.sepLine())
-	rows = append(rows, sHelp.Render("  ↑↓/[]/1-7 navigate  ·  enter open  ·  s save  ·  ctrl+q preview  ·  esc back"))
-	rows = append(rows, sHelp.Render("  ~ inherited from template   ✎ your override"))
+	rows = append(rows, sHelp.Render("  ↑↓/[] navigate  ·  enter/1-5 open  ·  ctrl+s save  ·  p preview  ·  esc back"))
+	rows = append(rows, sHelp.Render("  ~ inherited   ✎ changed or added"))
 	return strings.Join(rows, "\n")
 }
 
@@ -1229,35 +1790,66 @@ func (m *tui) serviceTabSummaries() []string {
 	} else if len(m.fSignals) == 0 {
 		sigs = "no signals"
 	}
-	service := fmt.Sprintf("every %ss · %s%% err · %s",
+	basics := fmt.Sprintf("every %ss · %s%% err · %s",
 		strings.TrimSpace(m.fInterval), strings.TrimSpace(m.fFailure), sigs)
-	if m.fMesh {
-		service += " · istio mesh"
+
+	trace := m.fTemplate
+	if !signalEnabled(m.fSignals, "spans") {
+		trace = sMuted.Render("spans disabled")
+	} else if trace == "" {
+		trace = sMuted.Render("generic spans")
 	}
-	spans := m.fTemplate
-	if spans == "" {
-		spans = sMuted.Render("none — generic spans")
-	}
-	spans += " · " + m.fSpanKind
+	trace += " · " + m.fSpanKind
 	if n, _ := strconv.Atoi(strings.TrimSpace(m.fChildSpans)); n > 0 {
-		spans += fmt.Sprintf(" · +%d local child", n)
+		trace += fmt.Sprintf(" · +%d local child", n)
 	}
-	calls := "none"
 	if len(m.fDownstream) > 0 {
-		calls = truncate(strings.Join(m.fDownstream, ", "), max(12, m.width-32))
+		trace += " · calls " + truncate(strings.Join(m.fDownstream, ", "), max(12, m.width-42))
 	}
-	metric := effectiveMetricConfig(Service{Name: strings.TrimSpace(m.fName), Metric: &MetricConfig{
-		Type: m.fMetricType, Name: m.fMetricName, Unit: m.fMetricUnit,
-	}})
-	metricsLogs := fmt.Sprintf("%s %s · %s logs", metric.Type, metric.Name, strings.ToUpper(effectiveLogSeverity(Service{LogSeverity: m.fLogSeverity})))
+
+	var signalParts []string
+	if signalEnabled(m.fSignals, "metrics") {
+		configured, err := parseMetricsText(m.fMetrics)
+		if err != nil {
+			signalParts = append(signalParts, sWarn.Render("metrics need attention"))
+		} else {
+			metrics := effectiveMetricConfigs(Service{Name: strings.TrimSpace(m.fName), Metrics: configured})
+			if len(metrics) == 1 {
+				signalParts = append(signalParts, fmt.Sprintf("%s %s", metrics[0].Type, metrics[0].Name))
+			} else {
+				names := make([]string, 0, len(metrics))
+				for _, metric := range metrics {
+					names = append(names, metric.Name)
+				}
+				signalParts = append(signalParts, fmt.Sprintf("%d metrics: %s", len(metrics), truncate(strings.Join(names, ", "), max(16, m.width-48))))
+			}
+		}
+	}
+	if signalEnabled(m.fSignals, "logs") {
+		severity, message, err := parseLogText(m.fLog)
+		logs := strings.ToUpper(severity) + " logs"
+		if err != nil {
+			logs = sWarn.Render("log needs attention")
+		} else if message != "" {
+			logs += " · " + truncate(message, max(12, m.width-48))
+		}
+		signalParts = append(signalParts, logs)
+	}
+	if len(signalParts) == 0 {
+		signalParts = append(signalParts, "no metric or log signal")
+	}
+	signalDetails := strings.Join(signalParts, " · ")
 	// The infra template can add system.*/process.* metrics of its own; without
 	// this the extra series are invisible until you open the payload preview.
-	if n := len(infraMetricNames(m.fInfraTemplate)); n > 0 {
-		metricsLogs += fmt.Sprintf(" · +%d %s", n, m.fInfraTemplate)
+	if signalEnabled(m.fSignals, "metrics") {
+		if n := len(infraMetricNames(m.fInfraTemplate)); n > 0 {
+			signalDetails += fmt.Sprintf(" · +%d %s", n, m.fInfraTemplate)
+		}
 	}
-	infraTmpl := m.fInfraTemplate
-	if infraTmpl == "" {
-		infraTmpl = sMuted.Render("none")
+
+	environment := m.fInfraTemplate
+	if environment == "" {
+		environment = sMuted.Render("none")
 	} else if infraUsesHostName(m.fInfraTemplate) {
 		// These names are the Dynatrace entity identity, so show them here
 		// rather than making the user open the tab to find out.
@@ -1267,27 +1859,31 @@ func (m *tui) serviceTabSummaries() []string {
 			HostName:      strings.TrimSpace(m.fHostName),
 			ProcessName:   strings.TrimSpace(m.fProcessName),
 		}
-		infraTmpl += " · " + effectiveHostName(svcForNames)
+		environment += " · " + effectiveHostName(svcForNames)
 		if infraUsesProcessName(m.fInfraTemplate) {
-			infraTmpl += "/" + effectiveProcessName(svcForNames)
+			environment += "/" + effectiveProcessName(svcForNames)
 		}
 	}
+	if m.fMesh {
+		environment += " · istio mesh"
+	}
+
+	advanced := "resource " + attrSummary(m.fAttrs, len(inheritedResourceAttrs(m.cfg, m.resourceInheritanceService()))) +
+		" · span " + attrSummary(m.fSpanAttrs, len(inheritedSpanAttrs(m.spanInheritanceService())))
 
 	return []string{
-		service,
-		spans,
-		calls,
-		infraTmpl,
-		metricsLogs,
-		attrSummary(m.fAttrs, len(infraDefaults(Service{Name: strings.TrimSpace(m.fName), InfraTemplate: m.fInfraTemplate}))),
-		attrSummary(m.fSpanAttrs, len(templateDefaults(m.fTemplate))),
+		basics,
+		environment,
+		trace,
+		signalDetails,
+		advanced,
 	}
 }
 
 func attrSummary(text string, inherited int) string {
 	n := len(parseAttrs(text))
 	if n > 0 {
-		return fmt.Sprintf("✎ %d override", n)
+		return fmt.Sprintf("✎ %d changed/added", n)
 	}
 	if inherited > 0 {
 		return fmt.Sprintf("~ %d inherited", inherited)
@@ -1301,22 +1897,68 @@ func (m *tui) helpView() string {
 		"  " + m.sepLine(),
 		"",
 		"  " + sBold.Render("Service list"),
-		sHelp.Render("    ↑↓/jk move · enter edit · n new"),
-		sHelp.Render("    space enable · d delete"),
-		sHelp.Render("    r run · t test · g config · ctrl+q preview · q quit"),
+		sHelp.Render("    ↑↓/jk move · pgup/pgdn page · enter edit · n new"),
+		sHelp.Render("    space toggle · d delete · p preview"),
+		sHelp.Render("    r run/stop · t test · c connection · ? help · q quit"),
 		"",
-		"  " + sBold.Render("Editor (tab selector)"),
-		sHelp.Render("    enter/1-7/]/[ open/navigate · s save · esc back"),
-		sHelp.Render("    ctrl+q payload preview"),
+		"  " + sBold.Render("Service editor"),
+		sHelp.Render("    ↑↓/[] choose section · enter/1-5 open · ctrl+s save"),
+		sHelp.Render("    esc goes back one level · p previews from the section list"),
 		sHelp.Render("    / filter templates · alt+enter new line in text fields"),
 		"",
 		"  " + sBold.Render("Attributes"),
-		sHelp.Render("    ~ inherited · ✎ service override"),
+		sHelp.Render("    ~ inherited · ✎ changed or added for this service"),
 		"",
 		"  " + m.sepLine(),
 		sHelp.Render("  press any key to go back"),
 	}
 	return strings.Join(rows, "\n")
+}
+
+func (m *tui) serviceListCapacity() int {
+	// Header, grouped footer and overflow indicators consume up to ten rows. Each
+	// compact service uses two rows; the selected one adds two detail rows.
+	overhead := 10
+	if m.flash != "" {
+		overhead += 2
+	}
+	capacity := (m.height - overhead) / 2
+	if capacity < 1 {
+		capacity = 1
+	}
+	return capacity
+}
+
+func (m *tui) ensureCursorVisible() {
+	n := len(m.cfg.Services)
+	if n == 0 {
+		m.cursor = 0
+		m.listOffset = 0
+		return
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor >= n {
+		m.cursor = n - 1
+	}
+	capacity := m.serviceListCapacity()
+	if m.cursor < m.listOffset {
+		m.listOffset = m.cursor
+	}
+	if m.cursor >= m.listOffset+capacity {
+		m.listOffset = m.cursor - capacity + 1
+	}
+	maxOffset := n - capacity
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if m.listOffset > maxOffset {
+		m.listOffset = maxOffset
+	}
+	if m.listOffset < 0 {
+		m.listOffset = 0
+	}
 }
 
 func (m *tui) listView() string {
@@ -1328,8 +1970,18 @@ func (m *tui) listView() string {
 	if len(m.cfg.Services) == 0 {
 		rows = append(rows, sMuted.Render("  No services yet — press n to create one."))
 	} else {
-		for i, svc := range m.cfg.Services {
+		m.ensureCursorVisible()
+		start := m.listOffset
+		end := min(len(m.cfg.Services), start+m.serviceListCapacity())
+		if start > 0 {
+			rows = append(rows, sMuted.Render(fmt.Sprintf("  ↑ %d more service(s)", start)))
+		}
+		for i := start; i < end; i++ {
+			svc := m.cfg.Services[i]
 			rows = append(rows, m.renderService(svc, i == m.cursor))
+		}
+		if end < len(m.cfg.Services) {
+			rows = append(rows, sMuted.Render(fmt.Sprintf("  ↓ %d more service(s)", len(m.cfg.Services)-end)))
 		}
 	}
 
@@ -1344,14 +1996,16 @@ func (m *tui) listView() string {
 	}
 
 	body := strings.Join(rows, "\n")
+	help := m.renderHelp()
 
 	// pad so the help line sits at the bottom of the terminal
 	lineCount := strings.Count(body, "\n") + 1
-	targetLine := m.height - 2
+	helpLines := strings.Count(help, "\n") + 1
+	targetLine := m.height - helpLines - 1
 	if lineCount < targetLine {
 		body += strings.Repeat("\n", targetLine-lineCount)
 	}
-	return body + "\n" + m.renderHelp()
+	return body + "\n" + help
 }
 
 func (m *tui) renderHeader() string {
@@ -1373,7 +2027,7 @@ func (m *tui) renderHeader() string {
 	case endpointFromEnv():
 		ep = sMuted.Render(m.cfg.runtimeConfig().Endpoint) + " " + sWarn.Render("[env]")
 	case ep == "":
-		ep = sMuted.Italic(true).Render("no endpoint — press g to configure")
+		ep = sMuted.Italic(true).Render("no endpoint — press c to connect")
 	default:
 		ep = sMuted.Render(ep)
 	}
@@ -1400,10 +2054,11 @@ func (m *tui) renderHeader() string {
 func (m *tui) renderService(svc Service, expanded bool) string {
 	cursor := "  "
 	style := colorForService(svc.Name)
-	name := style.Render(svc.Name)
+	displayName := truncate(svc.Name, max(8, min(36, m.width/3)))
+	name := style.Render(displayName)
 	if expanded {
 		cursor = sPrimary.Render("▶ ")
-		name = style.Bold(true).Render(svc.Name)
+		name = style.Bold(true).Render(displayName)
 	}
 
 	dot := sMuted.Render("○")
@@ -1422,7 +2077,10 @@ func (m *tui) renderService(svc Service, expanded bool) string {
 	if svc.ChildSpans > 0 {
 		meta = append(meta, fmt.Sprintf("+%d local child", svc.ChildSpans))
 	}
-	row1 := cursor + dot + " " + name + "  " + sMuted.Render(strings.Join(meta, "  "))
+	prefix := cursor + dot + " " + name + "  "
+	metaText := strings.Join(meta, "  ")
+	metaText = truncate(metaText, max(8, m.width-lipgloss.Width(prefix)))
+	row1 := prefix + sMuted.Render(metaText)
 
 	var lines []string
 	lines = append(lines, row1)
@@ -1461,9 +2119,7 @@ func (m *tui) renderService(svc Service, expanded bool) string {
 	}
 
 	// Expanded: show the attributes that will actually be emitted.
-	resAttrs := make(map[string]AttrValue, len(m.cfg.Attributes)+len(svc.Attributes)+8)
-	mergeAttrs(resAttrs, m.cfg.Attributes)
-	mergeAttrs(resAttrs, infraDefaults(svc))
+	resAttrs := inheritedResourceAttrs(m.cfg, svc)
 	mergeAttrs(resAttrs, svc.Attributes)
 	resMark := "✎"
 	if len(svc.Attributes) == 0 {
@@ -1471,8 +2127,7 @@ func (m *tui) renderService(svc Service, expanded bool) string {
 	}
 	lines = append(lines, m.attrLine("res ", resMark, resAttrs))
 
-	spanAttrs := map[string]AttrValue{}
-	mergeAttrs(spanAttrs, templateDefaults(svc.Template))
+	spanAttrs := inheritedSpanAttrs(svc)
 	mergeAttrs(spanAttrs, svc.SpanAttrs)
 	spanMark := "✎"
 	if len(svc.SpanAttrs) == 0 {
@@ -1510,23 +2165,41 @@ func renderHint(hint string) string {
 }
 
 func (m *tui) renderHelp() string {
-	full := []string{
-		"n new", "↵ edit", "d delete", "␣ toggle",
-		"r run/stop", "t test", "g config", "ctrl+q preview", "? help", "q quit",
+	line := func(label string, hints ...string) string {
+		parts := make([]string, len(hints))
+		for i, hint := range hints {
+			parts[i] = renderHint(hint)
+		}
+		prefix := "  "
+		if label != "" {
+			prefix += sMuted.Render(fmt.Sprintf("%-10s", label))
+		}
+		return prefix + strings.Join(parts, sHelp.Render("  ·  "))
 	}
-	medium := []string{"n new", "↵ edit", "r run/stop", "g config", "? help", "q quit"}
-	short := []string{"↵ edit", "r run", "? help", "q quit"}
 
-	sep := sHelp.Render("  ·  ")
-	for _, set := range [][]string{full, medium, short} {
-		parts := make([]string, len(set))
-		for i, h := range set {
-			parts[i] = renderHint(h)
-		}
-		line := "  " + strings.Join(parts, sep)
-		if lipgloss.Width(line) <= m.width {
-			return line
-		}
+	grouped := []string{
+		line("service", "n add", "↵ edit", "space toggle", "d delete", "p preview"),
+		line("run/setup", "r run/stop", "c connection", "t test", "? help", "q quit"),
+	}
+	if lipgloss.Width(grouped[0]) <= m.width && lipgloss.Width(grouped[1]) <= m.width {
+		return strings.Join(grouped, "\n")
+	}
+
+	compact := []string{
+		line("", "↵ edit", "space toggle", "d delete"),
+		line("", "n add", "p preview", "r run", "? help", "q quit"),
+	}
+	if lipgloss.Width(compact[0]) <= m.width && lipgloss.Width(compact[1]) <= m.width {
+		return strings.Join(compact, "\n")
+	}
+
+	narrow := []string{
+		line("", "↵ edit", "space toggle", "d delete"),
+		line("", "n add", "p preview", "r run"),
+		line("", "c connect", "? help", "q quit"),
+	}
+	if lipgloss.Width(narrow[0]) <= m.width && lipgloss.Width(narrow[1]) <= m.width && lipgloss.Width(narrow[2]) <= m.width {
+		return strings.Join(narrow, "\n")
 	}
 	return renderHint("? help")
 }
@@ -1603,42 +2276,12 @@ func attrValueText(v AttrValue, quote bool) string {
 	}
 }
 
-// inheritedResAttrsNote returns a multi-line description of the resource
-// attributes inherited by svc from global config, infra template, and Istio
-// mesh. All attributes are shown (no truncation). Returns ("", 0) when nothing
-// is inherited.
-func inheritedResAttrsNote(cfg Config, svc Service, budget int) (string, int) {
-	type src struct {
-		label string
-		attrs map[string]AttrValue
-	}
-	var sources []src
-	if len(cfg.Attributes) > 0 {
-		sources = append(sources, src{"global", cfg.Attributes})
-	}
-	if infra := infraDefaults(svc); len(infra) > 0 {
-		sources = append(sources, src{svc.InfraTemplate, infra})
-	}
-
-	if len(sources) == 0 && svc.Name == "" {
-		return "", 0
-	}
-	var lines []string
-	for _, s := range sources {
-		lines = append(lines, attrsBlock(s.label, s.attrs, budget)...)
-	}
-	if svc.Name != "" {
-		lines = append(lines, "service.name="+noteEscape(svc.Name)+" (always set)")
-	}
-	return strings.Join(lines, "\n"), len(lines)
-}
-
-// inheritedMetricsNote lists the metrics a service emits in addition to the one
-// configured on this tab: those the infra template contributes for Dynatrace
+// inheritedMetricsNote lists the metrics a service emits in addition to those
+// configured on this tab: the infra template series used for Dynatrace
 // entity extraction, and the Istio mesh series. Both are otherwise invisible
 // until something fails to show up in Grail.
 //
-// Returns ("", 0) when the service emits nothing beyond its configured metric.
+// Returns ("", 0) when the service emits nothing beyond its configured metrics.
 func inheritedMetricsNote(svc Service, budget, maxLines int) (string, int) {
 	var lines []string
 
@@ -1661,7 +2304,7 @@ func inheritedMetricsNote(svc Service, budget, maxLines int) (string, int) {
 			keep = 1
 		}
 		hidden := len(lines) - keep
-		lines = append(lines[:keep], fmt.Sprintf("  … +%d more (ctrl+q)", hidden))
+		lines = append(lines[:keep], fmt.Sprintf("  … +%d more (p preview)", hidden))
 	}
 	return strings.Join(lines, "\n"), len(lines)
 }
@@ -1678,8 +2321,7 @@ func entityKindsFor(template string) string {
 	return "entities"
 }
 
-// namesBlock renders a labelled, width-wrapped list of metric names, matching
-// how attrsBlock lays out inherited attributes.
+// namesBlock renders a labelled, width-wrapped list of metric names.
 func namesBlock(label string, names []string, lineWidth int) []string {
 	header := fmt.Sprintf("%s (%d)", noteEscape(label), len(names))
 	if len(names) == 0 {
@@ -1710,18 +2352,6 @@ func namesBlock(label string, names []string, lineWidth int) []string {
 	return append([]string{header}, out...)
 }
 
-// inheritedSpanAttrsNote returns a multi-line description of the span
-// attributes provided by the selected template. All attributes are shown.
-// Returns ("", 0) for no template.
-func inheritedSpanAttrsNote(template string, budget int) (string, int) {
-	tmpl := templateDefaults(template)
-	if len(tmpl) == 0 {
-		return "", 0
-	}
-	lines := attrsBlock(template, tmpl, budget)
-	return strings.Join(lines, "\n"), len(lines)
-}
-
 // noteEscape escapes characters that huh's Note.Description mini-renderer
 // treats as markdown: _ (italic), * (bold), ` (code). A leading \ causes
 // the renderer to emit the next rune literally, so \_  →  _.
@@ -1732,49 +2362,6 @@ func noteEscape(s string) string {
 	s = strings.ReplaceAll(s, "*", `\*`)
 	s = strings.ReplaceAll(s, "`", "\\`")
 	return s
-}
-
-// attrsBlock returns a header line ("label (N)") followed by wrapped lines of
-// "key=val" pairs. Every attribute is shown; pairs wrap when the next one
-// would exceed lineWidth characters.
-// Keys and values are noteEscape-d so that underscores survive huh's renderer.
-func attrsBlock(label string, attrs map[string]AttrValue, lineWidth int) []string {
-	header := fmt.Sprintf("%s (%d)", noteEscape(label), len(attrs))
-	if len(attrs) == 0 {
-		return []string{header}
-	}
-	keys := make([]string, 0, len(attrs))
-	for k := range attrs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	budget := lineWidth - 2 // 2-char indent on each wrapped line
-	if budget < 20 {
-		budget = 20
-	}
-	var result []string
-	var cur []string
-	used := 0
-	for _, k := range keys {
-		pair := noteEscape(k) + "=" + noteEscape(attrValueText(attrs[k], false))
-		addLen := len(pair)
-		if len(cur) > 0 {
-			addLen += 2 // "  " separator
-		}
-		if len(cur) > 0 && used+addLen > budget {
-			result = append(result, "  "+strings.Join(cur, "  "))
-			cur = nil
-			used = 0
-			addLen = len(pair)
-		}
-		cur = append(cur, pair)
-		used += addLen
-	}
-	if len(cur) > 0 {
-		result = append(result, "  "+strings.Join(cur, "  "))
-	}
-	return append([]string{header}, result...)
 }
 
 // attrsToText serialises a map[string]AttrValue to a human-editable
@@ -1870,7 +2457,7 @@ func parseAttrValue(v string) AttrValue {
 
 // openPayloadPreview builds a human-readable config summary for the currently
 // selected service and navigates to screenPayload. Available from both the list
-// and the service editor tab selector (ctrl+q).
+// and the service editor section selector (p; ctrl+q remains compatible).
 // The caller's screen and tabActive state are saved so that closing the preview
 // returns exactly where the user came from.
 func (m *tui) openPayloadPreview() (tea.Model, tea.Cmd) {
@@ -2033,8 +2620,8 @@ func (m *tui) formatOTLPJSON(traces, metrics, logs string) string {
 }
 
 // buildPayloadPreview returns a formatted multi-line string showing the
-// effective configuration that will be emitted for svc: resource attrs
-// (merged global → infra → service), span attrs, metric config, and signals.
+// effective configuration that will be emitted for svc: resource attributes,
+// span attributes, metric definitions, log settings, and enabled signals.
 func (m *tui) buildPayloadPreview(svc Service) string {
 	cfg := m.cfg
 	svc = normalizeService(svc)
@@ -2074,8 +2661,13 @@ func (m *tui) buildPayloadPreview(svc Service) string {
 		addRow("Downstream calls", strings.Join(svc.DownstreamCalls, ", "))
 	}
 	if svc.hasSignal(signalMetrics) {
-		mc := effectiveMetricConfig(svc)
-		addRow("Metric", fmt.Sprintf("%s %s (%s)", mc.Name, mc.Unit, mc.Type))
+		for i, metric := range effectiveMetricConfigs(svc) {
+			label := ""
+			if i == 0 {
+				label = "Metrics"
+			}
+			addRow(label, fmt.Sprintf("%s %s (%s)", metric.Name, metric.Unit, metric.Type))
+		}
 		// Dynatrace entity extraction routes on the metric key, so spell these
 		// out rather than leaving the reader to infer them from the template.
 		for _, im := range infraMetrics(svc, time.Now()) {
@@ -2083,51 +2675,39 @@ func (m *tui) buildPayloadPreview(svc Service) string {
 		}
 	}
 	if svc.hasSignal(signalLogs) {
-		addRow("Log severity", strings.ToUpper(effectiveLogSeverity(svc)))
+		message := svc.LogMessage
+		if message == "" {
+			message = "generated from the service/span"
+		}
+		addRow("Log", strings.ToUpper(effectiveLogSeverity(svc))+" | "+message)
 	}
 
 	b.WriteString("\n  " + m.sepLine() + "\n\n")
 
 	// ── resource attributes ───────────────────────────────────────────────
-	b.WriteString(sBold.Render("  Resource attributes") + sMuted.Render(" (global → infra → service)") + "\n\n")
-	if len(cfg.Attributes) > 0 {
-		b.WriteString(sMuted.Render("  global:") + "\n")
-		for _, k := range sortedKeys(cfg.Attributes) {
-			b.WriteString(fmt.Sprintf("    %s = %s\n", k, attrValueText(cfg.Attributes[k], false)))
-		}
-	}
-	infra := infraDefaults(svc)
-	if len(infra) > 0 {
-		b.WriteString(sMuted.Render(fmt.Sprintf("  %s (infra template):", svc.InfraTemplate)) + "\n")
-		for _, k := range sortedKeys(infra) {
-			b.WriteString(fmt.Sprintf("    %s = %s\n", k, attrValueText(infra[k], false)))
-		}
-	}
-	b.WriteString(sMuted.Render("  service:") + "\n")
-	b.WriteString(fmt.Sprintf("    service.name = %s\n", svc.Name))
-	for _, k := range sortedKeys(svc.Attributes) {
-		b.WriteString(fmt.Sprintf("    %s = %s\n", k, attrValueText(svc.Attributes[k], false)))
+	b.WriteString(sBold.Render("  Resource attributes") + sMuted.Render(" (effective)") + "\n\n")
+	resourceAttrs := inheritedResourceAttrs(cfg, svc)
+	mergeAttrs(resourceAttrs, svc.Attributes)
+	resourceAttrs["service.name"] = strAttrVal(svc.Name)
+	for _, k := range sortedKeys(resourceAttrs) {
+		b.WriteString(fmt.Sprintf("    %s = %s\n", k, attrValueText(resourceAttrs[k], false)))
 	}
 
 	b.WriteString("\n")
 
 	// ── span attributes ───────────────────────────────────────────────────
 	if svc.hasSignal(signalSpans) {
-		b.WriteString(sBold.Render("  Span attributes") + sMuted.Render(" (template → overrides)") + "\n\n")
-		tmpl := templateDefaults(svc.Template)
-		if len(tmpl) > 0 {
-			b.WriteString(sMuted.Render(fmt.Sprintf("  %s (template):", svc.Template)) + "\n")
-			for _, k := range sortedKeys(tmpl) {
-				b.WriteString(fmt.Sprintf("    %s = %s\n", k, attrValueText(tmpl[k], false)))
+		b.WriteString(sBold.Render("  Span attributes") + sMuted.Render(" (generated sample)") + "\n\n")
+		effective := inheritedSpanAttrs(svc)
+		mergeAttrs(effective, svc.SpanAttrs)
+		for _, k := range sortedKeys(effective) {
+			mark := "~"
+			if _, changed := svc.SpanAttrs[k]; changed {
+				mark = "✎"
 			}
+			b.WriteString(fmt.Sprintf("    %s %s = %s\n", mark, k, attrValueText(effective[k], false)))
 		}
-		if len(svc.SpanAttrs) > 0 {
-			b.WriteString(sMuted.Render("  overrides:") + "\n")
-			for _, k := range sortedKeys(svc.SpanAttrs) {
-				b.WriteString(fmt.Sprintf("    %s = %s\n", k, attrValueText(svc.SpanAttrs[k], false)))
-			}
-		}
-		if len(tmpl) == 0 && len(svc.SpanAttrs) == 0 {
+		if len(effective) == 0 {
 			b.WriteString(sMuted.Render("  none") + "\n")
 		}
 		b.WriteString("\n")

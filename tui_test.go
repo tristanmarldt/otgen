@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -10,7 +11,7 @@ import (
 
 func testTUI(t *testing.T) *tui {
 	t.Helper()
-	app := NewApp("/dev/null", 0)
+	app := NewApp(filepath.Join(t.TempDir(), "config.json"), 0)
 	app.cfg = normalizeConfig(Config{
 		Endpoint:   "https://example.live.dynatrace.com/api/v2/otlp",
 		Token:      "dt0c01.TOKEN",
@@ -73,6 +74,106 @@ func TestNewServiceOpensSettings(t *testing.T) {
 	}
 }
 
+func TestMissingEndpointOpensConnectionOnFirstWindowSize(t *testing.T) {
+	t.Setenv("OTGEN_ENDPOINT", "")
+	app := NewApp(filepath.Join(t.TempDir(), "config.json"), 0)
+	m := NewTUIModel(app)
+
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 32})
+
+	if m.screen != screenGlobal || m.form == nil {
+		t.Fatalf("first run did not open connection setup: screen=%v form=%v", m.screen, m.form != nil)
+	}
+}
+
+func TestMissingTokenDoesNotBlockConfigurationFlow(t *testing.T) {
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envToken, "")
+	app := NewApp(filepath.Join(t.TempDir(), "config.json"), 0)
+	app.cfg = normalizeConfig(Config{
+		Endpoint: "https://example.live.dynatrace.com/api/v2/otlp",
+		Services: []Service{{Name: "svc", Enabled: true}},
+	})
+	m := NewTUIModel(app)
+	m.Update(tea.WindowSizeMsg{Width: 100, Height: 32})
+
+	if m.screen != screenList || m.form != nil {
+		t.Fatalf("blank token blocked setup: screen=%v form=%v", m.screen, m.form != nil)
+	}
+}
+
+func TestServiceSectionsFollowGeneratorDependencies(t *testing.T) {
+	want := "Basics|Environment|Trace scenario|Signal details|Advanced"
+	if got := strings.Join(serviceTabNames, "|"); got != want {
+		t.Fatalf("service section order = %q, want %q", got, want)
+	}
+	if !(tabEnvironment < tabTrace && tabEnvironment < tabSignalDetails) {
+		t.Fatal("environment must precede trace and signal details because it changes their emitted telemetry")
+	}
+}
+
+func TestDisabledSignalsHideIrrelevantDetailForms(t *testing.T) {
+	m := testTUI(t)
+	m.loadServiceFields(0)
+	m.fSignals = []string{"logs"}
+
+	m.traceStep = 0
+	traceForm := m.makeServiceTabForm(tabTrace)
+	traceForm.Init()
+	traceView := stripANSI(traceForm.View())
+	if !strings.Contains(traceView, "Enable Spans in Basics") {
+		t.Fatalf("trace section still exposes span options when spans are disabled:\n%s", traceView)
+	}
+
+	signalForm := m.makeServiceTabForm(tabSignalDetails)
+	signalForm.Init()
+	signalView := stripANSI(signalForm.View())
+	if strings.Contains(signalView, "Metrics") || !strings.Contains(signalView, "SEVERITY | message") {
+		t.Fatalf("signal details do not match enabled signals:\n%s", signalView)
+	}
+}
+
+func TestCtrlSSavesFromOpenServiceForm(t *testing.T) {
+	m := testTUI(t)
+	m.loadServiceFields(0)
+	m.screen, m.tabActive, m.editTab = screenServiceEdit, false, tabBasics
+	m.form = m.makeServiceTabForm(tabBasics)
+	m.fFailure = "25"
+
+	m.updateForm(tea.KeyMsg{Type: tea.KeyCtrlS})
+
+	if got := m.app.GetConfig().Services[0].FailureRate; got != 25 {
+		t.Fatalf("ctrl+s saved failure rate %d, want 25", got)
+	}
+	if m.screen != screenList {
+		t.Fatalf("ctrl+s left screen=%v, want service list", m.screen)
+	}
+}
+
+func TestServiceListKeepsCursorInsideViewport(t *testing.T) {
+	m := testTUI(t)
+	m.width, m.height = 80, 24
+	m.cfg.Services = nil
+	for i := 0; i < 20; i++ {
+		m.cfg.Services = append(m.cfg.Services, normalizeService(Service{
+			Name: fmt.Sprintf("svc-%02d", i), SpanKind: "server", Interval: 5, Enabled: true,
+		}))
+	}
+	m.cursor = len(m.cfg.Services) - 1
+	m.ensureCursorVisible()
+
+	view := stripANSI(m.View())
+	if m.listOffset == 0 {
+		t.Fatal("long service list did not advance its viewport")
+	}
+	if !strings.Contains(view, "svc-19") {
+		t.Fatalf("selected service is not visible:\n%s", view)
+	}
+	if got := strings.Count(view, "\n") + 1; got > m.height {
+		t.Fatalf("service list renders %d rows in a %d-row terminal", got, m.height)
+	}
+}
+
 func TestHelpFitsStandardTerminal(t *testing.T) {
 	m := testTUI(t)
 	m.width, m.height, m.screen = 80, 24, screenHelp
@@ -88,18 +189,29 @@ func TestSettingsSummaryLeavesEnabledToOverview(t *testing.T) {
 	}
 }
 
-func TestServiceFormKeepsMeshDescriptionReadable(t *testing.T) {
+func TestEnvironmentKeepsInfrastructureAndMeshSeparate(t *testing.T) {
 	m := testTUI(t)
 	m.loadServiceFields(0)
 	m.width, m.height, m.screen = 80, 24, screenServiceEdit
-	m.form = m.makeServiceTabForm(tabService)
-	m.form.Init()
-	view := stripANSI(m.form.View())
-	if !strings.Contains(view, "Istio mesh") {
-		t.Errorf("service form missing %q:\n%s", "Istio mesh", view)
+	m.editTab = tabInfrastructure
+
+	menu := m.makeServiceTabForm(tabInfrastructure)
+	menu.Init()
+	menuView := stripANSI(menu.View())
+	for _, want := range []string{"Infrastructure", "Istio mesh telemetry"} {
+		if !strings.Contains(menuView, want) {
+			t.Fatalf("environment menu missing %q:\n%s", want, menuView)
+		}
 	}
-	if strings.Contains(view, "meshspan") {
-		t.Fatalf("mesh label and description run together:\n%s", view)
+
+	m.environmentStep = 1
+	m.environmentTarget = "infrastructure"
+	m.fInfraStep = 0
+	infra := m.makeServiceTabForm(tabInfrastructure)
+	infra.Init()
+	infraView := stripANSI(infra.View())
+	if !strings.Contains(infraView, "Infrastructure — category") || strings.Contains(infraView, "Istio mesh") {
+		t.Fatalf("infrastructure path mixes category and mesh controls:\n%s", infraView)
 	}
 }
 
@@ -141,6 +253,150 @@ func TestAttributeOverridesSurviveTemplateSwitch(t *testing.T) {
 	}
 }
 
+func TestInheritedResourceAttributeCanBeEditedDirectly(t *testing.T) {
+	m := testTUI(t)
+	m.loadServiceFields(0)
+	m.fInfraCategory = "kubernetes"
+	m.fInfraTemplate = "k8s"
+	m.prepareResourceAttrsEditor()
+
+	if !strings.Contains(m.fResourceAttrs, "k8s.cluster.name=my-cluster") {
+		t.Fatalf("effective editor does not contain inherited template values:\n%s", m.fResourceAttrs)
+	}
+	m.fResourceAttrs = strings.Replace(m.fResourceAttrs, "k8s.cluster.name=my-cluster", "k8s.cluster.name=production", 1)
+	m.syncResourceAttrsEditor()
+
+	svc := m.buildServiceFromFields()
+	if got := svc.Attributes["k8s.cluster.name"]; got != strAttrVal("production") {
+		t.Fatalf("edited inherited attribute = %+v, want production override", got)
+	}
+	if len(svc.Attributes) != 1 {
+		t.Fatalf("unchanged inherited attributes were persisted: %+v", svc.Attributes)
+	}
+}
+
+func TestInheritedSpanAttributeCanBeEditedDirectly(t *testing.T) {
+	m := testTUI(t)
+	m.loadServiceFields(0)
+	m.fTemplate = "http-server"
+	m.prepareSpanAttrsEditor()
+
+	if !strings.Contains(m.fSpanAttrsEdit, "http.request.method=GET") {
+		t.Fatalf("span sample editor does not contain template values:\n%s", m.fSpanAttrsEdit)
+	}
+	m.fSpanAttrsEdit = strings.Replace(m.fSpanAttrsEdit, "http.request.method=GET", "http.request.method=POST", 1)
+	m.syncSpanAttrsEditor()
+
+	svc := m.buildServiceFromFields()
+	if got := svc.SpanAttrs["http.request.method"]; got != strAttrVal("POST") {
+		t.Fatalf("edited template attribute = %+v, want POST override", got)
+	}
+	if len(svc.SpanAttrs) != 1 {
+		t.Fatalf("unchanged template span attributes were persisted: %+v", svc.SpanAttrs)
+	}
+}
+
+func TestMetricsEditorStartsWithCompleteDefaultExample(t *testing.T) {
+	m := testTUI(t)
+	m.loadServiceFields(0)
+	if want := "sum | svc.requests.total | 1"; m.fMetrics != want {
+		t.Fatalf("default metric row = %q, want %q", m.fMetrics, want)
+	}
+
+	m.fName = "checkout"
+	form := m.makeServiceTabForm(tabSignalDetails)
+	form.Init()
+	view := stripANSI(form.View())
+	if !strings.Contains(view, "sum | checkout.requests.total | 1") {
+		t.Fatalf("metrics editor lacks complete first-line example:\n%s", view)
+	}
+	if svc := m.buildServiceFromFields(); len(svc.Metrics) != 0 {
+		t.Fatalf("untouched generated example was persisted: %+v", svc.Metrics)
+	}
+	metrics, err := parseMetricsText("")
+	if err != nil || len(metrics) != 1 {
+		t.Fatalf("blank example did not resolve to default metric: metrics=%+v err=%v", metrics, err)
+	}
+}
+
+func TestLogSeverityAndMessageShareOneField(t *testing.T) {
+	severity, message, err := parseLogText("WARN | checkout queue is growing")
+	if err != nil || severity != "warn" || message != "checkout queue is growing" {
+		t.Fatalf("combined log = severity %q, message %q, err %v", severity, message, err)
+	}
+	severity, message, err = parseLogText("checkout completed")
+	if err != nil || severity != "info" || message != "checkout completed" {
+		t.Fatalf("message-only log = severity %q, message %q, err %v", severity, message, err)
+	}
+
+	m := testTUI(t)
+	m.loadServiceFields(0)
+	form := m.makeServiceTabForm(tabSignalDetails)
+	form.Init()
+	view := stripANSI(form.View())
+	if !strings.Contains(view, "SEVERITY | message") || strings.Contains(view, "Log severity") || strings.Contains(view, "Log message") {
+		t.Fatalf("log settings are not combined into one field:\n%s", view)
+	}
+}
+
+func TestRunWithoutTokenShowsErrorWithoutLeavingList(t *testing.T) {
+	m := testTUI(t)
+	m.cfg.Token = ""
+	m.app.cfg.Token = ""
+
+	m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+
+	if !m.flashErr || !strings.Contains(m.flash, "API token is required") {
+		t.Fatalf("missing-token run error = %q", m.flash)
+	}
+	if m.screen != screenList || m.status.Running {
+		t.Fatalf("missing-token run changed state: screen=%v running=%v", m.screen, m.status.Running)
+	}
+}
+
+func TestListActionsRemainDirectShortcuts(t *testing.T) {
+	m := testTUI(t)
+	m.updateList(tea.KeyMsg{Type: tea.KeySpace})
+	if m.cfg.Services[0].Enabled {
+		t.Fatal("space did not toggle the selected service directly")
+	}
+
+	m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+	if m.screen != screenConfirmDelete {
+		t.Fatalf("d opened screen %v, want delete confirmation", m.screen)
+	}
+}
+
+func TestStandardListFooterKeepsDirectActionsVisible(t *testing.T) {
+	m := testTUI(t)
+	m.width = 80
+	footer := stripANSI(m.renderHelp())
+	for _, want := range []string{"space", "toggle", "d delete", "p preview"} {
+		if !strings.Contains(footer, want) {
+			t.Fatalf("80-column footer hides %q:\n%s", want, footer)
+		}
+	}
+}
+
+func TestChangingInfraCategoryClearsStaleTemplate(t *testing.T) {
+	m := testTUI(t)
+	m.loadServiceFields(0)
+	m.screen, m.editTab, m.tabActive = screenServiceEdit, tabEnvironment, false
+	m.environmentStep = 1
+	m.environmentTarget = "infrastructure"
+	m.fInfraStep = 0
+	m.fInfraCategory = "container"
+
+	m.commitForm()
+
+	if m.fInfraTemplate == "k8s" || infraCategoryOf[m.fInfraTemplate] != "container" {
+		t.Fatalf("template = %q after changing to container category", m.fInfraTemplate)
+	}
+	if m.fInfraStep != 1 {
+		t.Fatalf("infrastructure step = %d, want template step", m.fInfraStep)
+	}
+}
+
 // TestEnvOverridesAreSurfaced checks that an env-var override is visible in the
 // header rather than silently beating whatever the user typed in the UI.
 func TestEnvOverridesAreSurfaced(t *testing.T) {
@@ -178,6 +434,13 @@ func TestTemplateSelectsRenderEveryOption(t *testing.T) {
 		m.editTab = tc.tab
 		m.tabActive = false
 		m.screen = screenServiceEdit
+		if tc.tab == tabSpans {
+			m.traceStep = 1
+		}
+		if tc.tab == tabInfrastructure {
+			m.environmentStep = 1
+			m.environmentTarget = "infrastructure"
+		}
 		m.form = m.makeServiceTabForm(tc.tab)
 		m.form.Init()
 
@@ -270,23 +533,21 @@ func TestNumericNavigationReachesAllTabs(t *testing.T) {
 	}
 }
 
-func TestCallsAndMetricsLogsRoundTrip(t *testing.T) {
+func TestCallsMetricsAndLogsRoundTrip(t *testing.T) {
 	m := testTUI(t)
 	m.loadServiceFields(0)
 	m.fDownstream = []string{"payment-svc", "inventory-svc"}
-	m.fMetricType = "histogram"
-	m.fMetricName = "latency"
-	m.fMetricUnit = "ms"
-	m.fLogSeverity = "warn"
+	m.fMetrics = "histogram | latency | ms\ngauge | queue.depth | 1"
+	m.fLog = "WARN | checkout queue is growing"
 	svc := m.buildServiceFromFields()
 	if len(svc.DownstreamCalls) != 2 || svc.DownstreamCalls[0] != "payment-svc" {
 		t.Fatalf("downstream calls = %+v", svc.DownstreamCalls)
 	}
-	if svc.Metric == nil || svc.Metric.Type != "histogram" || svc.Metric.Name != "latency" || svc.Metric.Unit != "ms" {
-		t.Fatalf("metric config = %+v", svc.Metric)
+	if len(svc.Metrics) != 2 || svc.Metrics[0].Type != "histogram" || svc.Metrics[0].Name != "latency" || svc.Metrics[1].Name != "queue.depth" {
+		t.Fatalf("metric configs = %+v", svc.Metrics)
 	}
-	if svc.LogSeverity != "warn" {
-		t.Fatalf("log severity = %q", svc.LogSeverity)
+	if svc.LogSeverity != "warn" || svc.LogMessage != "checkout queue is growing" {
+		t.Fatalf("log config = severity %q, message %q", svc.LogSeverity, svc.LogMessage)
 	}
 }
 
@@ -331,14 +592,16 @@ func TestTabBarFitsNarrowTerminals(t *testing.T) {
 	}
 }
 
-// TestHelpLineFitsNarrowTerminals guards the help footer against wrapping.
+// TestHelpLineFitsNarrowTerminals guards each grouped footer row against wrapping.
 func TestHelpLineFitsNarrowTerminals(t *testing.T) {
 	m := testTUI(t)
 	for _, w := range []int{40, 62, 80, 100, 160} {
 		m.width = w
-		line := m.renderHelp()
-		if got := len([]rune(stripANSI(line))); got > w {
-			t.Errorf("help line is %d cols at width %d: %q", got, w, line)
+		footer := m.renderHelp()
+		for _, line := range strings.Split(footer, "\n") {
+			if got := len([]rune(stripANSI(line))); got > w {
+				t.Errorf("help line is %d cols at width %d: %q", got, w, line)
+			}
 		}
 	}
 }
@@ -399,7 +662,7 @@ func testMetricsTabFits(t *testing.T, rows int) {
 }
 
 // TestInheritedMetricsNoteNamesTheSeries checks the note actually lists what
-// the service emits beyond its configured metric, and escapes underscores for
+// the service emits beyond its configured metrics, and escapes underscores for
 // huh's markdown mini-renderer (system.cpu.load_average.1m would otherwise
 // render as italics).
 func TestInheritedMetricsNoteNamesTheSeries(t *testing.T) {
@@ -435,6 +698,8 @@ func TestInfraPlaceholderMatchesEmittedHostName(t *testing.T) {
 			m := testTUI(t)
 			m.loadServiceFields(0)
 			m.fName, m.fInfraTemplate, m.fHostName = "checkout", tmpl, ""
+			m.environmentStep = 1
+			m.environmentTarget = "infrastructure"
 			m.fInfraStep = 2
 			m.form = m.makeServiceTabForm(tabInfrastructure)
 			m.form.Init()

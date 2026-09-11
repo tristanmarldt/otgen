@@ -148,6 +148,59 @@ func TestMetricTypes(t *testing.T) {
 	}
 }
 
+func TestMultipleMetricsAreEmitted(t *testing.T) {
+	cfg := normalizeConfig(Config{Services: []Service{{
+		Name:    "svc",
+		Signals: []string{"metrics"},
+		Metrics: []MetricConfig{
+			{Type: "sum", Name: "requests.total", Unit: "1"},
+			{Type: "gauge", Name: "queue.depth", Unit: "1"},
+			{Type: "histogram", Name: "request.duration", Unit: "ms"},
+		},
+	}}})
+	payloads, err := buildEmissionPayloads(cfg, cfg.Services[0])
+	if err != nil {
+		t.Fatalf("buildEmissionPayloads: %v", err)
+	}
+	var request collectormetricspb.ExportMetricsServiceRequest
+	if err := proto.Unmarshal(payloads.Metrics, &request); err != nil {
+		t.Fatalf("decode metrics: %v", err)
+	}
+	metrics := request.ResourceMetrics[0].ScopeMetrics[0].Metrics
+	if len(metrics) != 3 {
+		t.Fatalf("metric count = %d, want 3", len(metrics))
+	}
+	for i, want := range []string{"requests.total", "queue.depth", "request.duration"} {
+		if metrics[i].Name != want {
+			t.Errorf("metric[%d].name = %q, want %q", i, metrics[i].Name, want)
+		}
+	}
+}
+
+func TestCustomLogMessageIsEmitted(t *testing.T) {
+	cfg := normalizeConfig(Config{Services: []Service{{
+		Name:        "svc",
+		Signals:     []string{"logs"},
+		LogSeverity: "warn",
+		LogMessage:  "checkout queue is growing",
+	}}})
+	payloads, err := buildEmissionPayloads(cfg, cfg.Services[0])
+	if err != nil {
+		t.Fatalf("buildEmissionPayloads: %v", err)
+	}
+	var request collectorlogspb.ExportLogsServiceRequest
+	if err := proto.Unmarshal(payloads.Logs, &request); err != nil {
+		t.Fatalf("decode logs: %v", err)
+	}
+	record := request.ResourceLogs[0].ScopeLogs[0].LogRecords[0]
+	if got := record.Body.GetStringValue(); got != "checkout queue is growing" {
+		t.Fatalf("log body = %q", got)
+	}
+	if record.SeverityText != "WARN" {
+		t.Fatalf("log severity = %q, want WARN", record.SeverityText)
+	}
+}
+
 func TestDownstreamCallUsesTargetProtocolTemplate(t *testing.T) {
 	for _, tc := range []struct {
 		template string

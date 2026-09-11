@@ -18,14 +18,15 @@ Run it, point it at an endpoint, watch spans · metrics · logs flow. Useful for
   ○ flaky-worker  consumer  [messaging]  2s  80% err
     disabled — press space to enable
 
-  n new · ↵ edit · d delete · ␣ toggle · r run/stop · t test · g config · ? help · q quit
+  service    n add · ↵ edit · space toggle · d delete · p preview
+  run/setup  r run/stop · c connection · t test · ? help · q quit
 ```
 
 ## Features
 
 - **Service-centric model** — each service emits independently with its own interval, span kind, failure rate, local child spans, signal selection, mesh options, and attributes
 - **Distributed scenarios** — connect services with downstream calls to generate one shared trace across an acyclic service graph
-- **Configurable signals** — choose sum, gauge, or histogram metrics and DEBUG/INFO/WARN/ERROR log severity
+- **Configurable signals** — emit multiple independently named sum, gauge, or histogram metrics and choose the generated log message and severity
 - **Semantic-convention templates** — HTTP, database, messaging and gRPC spans carry the right OTel attributes so Dynatrace detects the technology
 - **Istio mesh telemetry** — optionally add Istio workload semantics to spans/resources and standard mesh metrics to the Metrics signal
 - **Infrastructure templates** — Kubernetes (incl. EKS / GKE / AKS / OpenShift), ECS, Docker, Lambda, Cloud Foundry and more, matching what the Dynatrace collector's `k8sattributesprocessor` and Operator inject
@@ -40,18 +41,24 @@ go install github.com/tristanmarldt/otgen@latest
 otgen
 ```
 
-Press `g` to set your endpoint and token, `n` to add a service, `r` to start.
+On first launch, enter the endpoint and API token. You can leave the token blank
+while configuring the app, but starting a run without one shows an error. Press
+`Ctrl+T` to save and test the connection, or `Enter` to save without testing.
+Then press `r` to start; the included starter service is ready to emit.
 
 ### Build from source
 
 ```bash
 git clone https://github.com/tristanmarldt/otgen.git
 cd otgen
-go build -o otgen .
-./otgen
+make
+otgen
 ```
 
-Requires Go 1.24+.
+The default `make` target builds `./otgen` atomically and links
+`~/.local/bin/otgen` to it. After the first `make`, both `make` and a plain
+`go build` immediately update the command on your PATH. Requires Go 1.24+ and
+`~/.local/bin` on PATH.
 
 ## Key bindings
 
@@ -60,46 +67,50 @@ Press `?` in the app for the full reference.
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` or `j` / `k` | Navigate service list |
+| `PgUp` / `PgDn`, `Home` / `End` | Navigate longer service lists |
 | `↵` Enter | Open the service editor (tab list) |
 | `n` | Create a service |
-| `Space` | Toggle service enabled / disabled |
-| `d` | Delete service (with confirm) |
 | `r` | Start / stop sending |
-| `t` | Send one test span and report the result |
-| `g` | Global configuration (endpoint, token, attributes) |
+| `c` or `g` | Connection and global defaults |
+| `Space` / `d` / `p` | Toggle / delete / preview the selected service |
+| `t` | Direct connection-test shortcut |
 | `?` | Keyboard reference |
 | `q` | Quit |
 | `Esc` | Leave the current form, then leave the editor |
 
 ### Service editor
 
-The editor is split into seven tabs, reachable from the tab list or directly with `1`–`7`:
+The editor has five task-oriented sections, reachable from the section list or
+directly with `1`–`5`:
 
-| Tab | Contents |
-|-----|----------|
-| `1` Service | Name, interval, failure rate, signals, Istio mesh |
-| `2` Spans | Span template, span kind, local child spans |
-| `3` Calls | One downstream service name per line; calls must be acyclic |
-| `4` Metrics & logs | Metric type/name/unit and log severity |
-| `5` Infrastructure | Kubernetes (incl. EKS / GKE / AKS / OpenShift), containers, serverless, host |
-| `6` Resource attrs | Resource-level overrides |
-| `7` Span attrs | Span-level overrides for the span template |
+| Section | Contents |
+|---------|----------|
+| `1` Basics | Name, interval, failure rate, enabled signals |
+| `2` Environment | Separate infrastructure and Istio controls; infrastructure flows from category to template, then optional identity |
+| `3` Trace scenario | Span template/kind/children, then downstream calls when other services exist |
+| `4` Signal details | Multiple metric definitions and/or one combined log severity/message line, plus metrics added by the environment |
+| `5` Advanced | Effective resource and span attributes, payload preview |
 
-The tab list shows a summary of each tab and flags unsaved changes. `s` saves,
-`Esc` backs out (and asks first if anything is unsaved).
+The section list summarizes the whole service and flags unsaved changes.
+`Ctrl+S` saves from anywhere in the editor. `Esc` moves back one level and asks
+before discarding unsaved work.
 
-From **inside** a tab you can switch without going back to the list:
+From the section list:
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+R` | Next tab |
-| `Esc` | Back to the tab list |
+| `↑` / `↓`, `[` / `]` | Choose a section |
+| `Enter` or `1`–`5` | Open a section |
+| `p` | Preview the effective configuration or OTLP JSON |
+| `Ctrl+S` | Save and return to the service list |
+| `Esc` | Return to the service list |
 
-`Ctrl+1`–`7` is deliberately not used: terminals cannot transmit it — `Ctrl+1`
-sends nothing at all and `Ctrl+3` arrives as `Esc`.
-
-Attributes marked `~` are inherited from the selected template. Attribute
-editors contain only explicit overrides, marked `✎`.
+Attributes marked `~` are inherited. The Resource editor shows the effective
+global, infrastructure, and Istio values. The Span editor shows a complete,
+deterministic sample of the attributes generated by the span and mesh templates.
+Both put those values directly in editable text: edit a key to override it or
+add a new key. Only changed and added values are stored on the service, marked
+`✎`, so untouched values continue to follow their template.
 
 New configurations start with no custom resource attributes. Add values such as
 `env`, `dt.cost.costcenter`, or `dt.security_context` in Global configuration
@@ -115,7 +126,11 @@ Downstream calls are additive service relationships. For example:
 {
   "name": "checkout-svc",
   "downstreamCalls": ["payment-svc"],
-  "metric": {"type": "histogram", "unit": "ms"},
+  "metrics": [
+    {"type": "histogram", "name": "checkout.request.duration", "unit": "ms"},
+    {"type": "gauge", "name": "checkout.queue.depth", "unit": "1"}
+  ],
+  "logMessage": "checkout request processed",
   "logSeverity": "info",
   "mesh": true
 }
@@ -131,9 +146,13 @@ inherit protocol semantics from the target template: HTTP templates add HTTP
 client attributes, gRPC adds RPC attributes, and generic targets keep the
 minimal edge attributes.
 
-Metric defaults are `<service>.requests.total` (`sum`), `<service>.load`
-(`gauge`), and `<service>.request.duration` (`histogram`). Histogram values are
-delta observations in milliseconds. Logs default to `INFO`; failed service
+Signal details starts with a complete default metric row. Enter additional
+metrics one per line as `type | name | unit`. Names and units may be omitted;
+defaults are `<service>.requests.total` (`sum`),
+`<service>.load` (`gauge`), and `<service>.request.duration` (`histogram`).
+Histogram values are delta observations in milliseconds. Logs default to a
+generated message at `INFO`. Enter `WARN | checkout queue is growing` to set
+both log fields together, or enter only a message to keep `INFO`. Failed service
 spans promote lower configured severities to `ERROR`.
 
 ## Attributes

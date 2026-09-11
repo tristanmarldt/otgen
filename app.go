@@ -63,6 +63,9 @@ func (a *App) Start() error {
 	if strings.TrimSpace(runtimeCfg.Endpoint) == "" {
 		return fmt.Errorf("endpoint is required")
 	}
+	if strings.TrimSpace(runtimeCfg.Token) == "" {
+		return fmt.Errorf("API token is required")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a.runCancel = cancel
 	a.status.Running = true
