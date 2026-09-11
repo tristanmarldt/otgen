@@ -249,6 +249,15 @@ func normalizeService(svc Service) Service {
 	svc.LogSeverity = strings.ToLower(strings.TrimSpace(svc.LogSeverity))
 	svc.HostName = strings.TrimSpace(svc.HostName)
 	svc.ProcessName = strings.TrimSpace(svc.ProcessName)
+	// Only host-category templates read these. Without clearing them, switching
+	// a service to k8s leaves the old names in config.json as dead config and
+	// makes the editor report unsaved changes for a no-op edit.
+	if !infraUsesHostName(svc.InfraTemplate) {
+		svc.HostName = ""
+	}
+	if !infraUsesProcessName(svc.InfraTemplate) {
+		svc.ProcessName = ""
+	}
 	return svc
 }
 

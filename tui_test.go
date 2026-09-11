@@ -424,3 +424,51 @@ func TestInheritedMetricsNoteNamesTheSeries(t *testing.T) {
 		t.Errorf("k8s should produce no note, got %d lines: %q", lines, note)
 	}
 }
+
+// TestInfraPlaceholderMatchesEmittedHostName guards the duplication this change
+// removed: tui.go carried its own copy of the per-template default host name,
+// so editing one and not the other made the editor advertise a placeholder the
+// generator never sent.
+func TestInfraPlaceholderMatchesEmittedHostName(t *testing.T) {
+	for _, tmpl := range []string{"host", "process", "otel-host", "otel-host-process"} {
+		t.Run(tmpl, func(t *testing.T) {
+			m := testTUI(t)
+			m.loadServiceFields(0)
+			m.fName, m.fInfraTemplate, m.fHostName = "checkout", tmpl, ""
+			m.fInfraStep = 2
+			m.form = m.makeServiceTabForm(tabInfrastructure)
+			m.form.Init()
+
+			svc := Service{Name: "checkout", InfraTemplate: tmpl}
+			want := effectiveHostName(svc)
+			if got := infraDefaults(svc)["host.name"].Str; got != want {
+				t.Fatalf("emitted host.name = %q, want %q", got, want)
+			}
+			if view := stripANSI(m.form.View()); !strings.Contains(view, want) {
+				t.Errorf("name step does not show the host name it will emit (%q):\n%s", want, view)
+			}
+		})
+	}
+}
+
+// TestInfraSummaryShowsEntityNames checks the tab selector surfaces the names
+// that become the Dynatrace entity identity.
+func TestInfraSummaryShowsEntityNames(t *testing.T) {
+	m := testTUI(t)
+	m.loadServiceFields(0)
+	m.fName, m.fInfraTemplate = "checkout", "otel-host-process"
+	m.fHostName, m.fProcessName = "web-01", "java"
+
+	got := stripANSI(m.serviceTabSummaries()[tabInfrastructure])
+	for _, want := range []string{"otel-host-process", "web-01", "java"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("infra summary %q missing %q", got, want)
+		}
+	}
+
+	// A template with no host name must not gain a stray separator.
+	m.fInfraTemplate = "k8s"
+	if got := stripANSI(m.serviceTabSummaries()[tabInfrastructure]); strings.Contains(got, "·") {
+		t.Errorf("k8s summary should not show host names: %q", got)
+	}
+}
