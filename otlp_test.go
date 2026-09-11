@@ -460,3 +460,44 @@ func TestHostMemoryMetricsAgree(t *testing.T) {
 		t.Errorf("usage implies %.4f utilization, but utilization reports %.4f", got, usedFraction)
 	}
 }
+
+// TestInfraMetricNamesMatchInfraMetrics keeps the UI's name list in step with
+// what is actually emitted. infraMetricNames exists so the editor can describe
+// a template without building throwaway protos on every render, and a stale
+// copy would quietly advertise metrics the generator no longer sends.
+func TestInfraMetricNamesMatchInfraMetrics(t *testing.T) {
+	for _, template := range []string{"otel-host", "otel-host-process", "k8s", ""} {
+		t.Run(template, func(t *testing.T) {
+			var emitted []string
+			for _, m := range infraMetrics(Service{Name: "svc", InfraTemplate: template}, time.Now()) {
+				emitted = append(emitted, m.Name)
+			}
+			declared := infraMetricNames(template)
+			if len(declared) != len(emitted) {
+				t.Fatalf("infraMetricNames lists %d metrics, infraMetrics emits %d\n  listed:  %v\n  emitted: %v",
+					len(declared), len(emitted), declared, emitted)
+			}
+			for i := range emitted {
+				if declared[i] != emitted[i] {
+					t.Errorf("index %d: listed %q, emitted %q", i, declared[i], emitted[i])
+				}
+			}
+		})
+	}
+}
+
+// TestIstioMetricNamesMatchIstioMetrics is the same guard for the mesh series.
+func TestIstioMetricNamesMatchIstioMetrics(t *testing.T) {
+	var emitted []string
+	for _, m := range istioMetrics(Service{Name: "svc"}, time.Now(), false) {
+		emitted = append(emitted, m.Name)
+	}
+	if len(istioMetricNames) != len(emitted) {
+		t.Fatalf("istioMetricNames = %v, istioMetrics emits %v", istioMetricNames, emitted)
+	}
+	for i := range emitted {
+		if istioMetricNames[i] != emitted[i] {
+			t.Errorf("index %d: listed %q, emitted %q", i, istioMetricNames[i], emitted[i])
+		}
+	}
+}

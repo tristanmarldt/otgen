@@ -728,6 +728,31 @@ func infraMetrics(svc Service, now time.Time) []*metricspb.Metric {
 	return nil
 }
 
+// infraMetricNames lists the metric keys infraMetrics emits for a template.
+// The UI needs the names to describe what a service sends; going through
+// infraMetrics for that would build throwaway protos and draw RNG samples on
+// every render. Kept adjacent to infraMetrics so the two stay in step —
+// TestInfraMetricNamesMatchInfraMetrics fails if they drift.
+func infraMetricNames(template string) []string {
+	switch template {
+	case "otel-host":
+		return []string{
+			"system.cpu.utilization", "system.cpu.load_average.1m",
+			"system.memory.utilization", "system.memory.usage",
+		}
+	case "otel-host-process":
+		return append(infraMetricNames("otel-host"),
+			"process.cpu.utilization", "process.memory.usage", "process.memory.virtual")
+	}
+	return nil
+}
+
+// istioMetricNames lists the metric keys istioMetrics emits, for the same reason.
+var istioMetricNames = []string{
+	"istio_requests_total", "istio_request_duration_milliseconds",
+	"istio_request_bytes", "istio_response_bytes",
+}
+
 // gaugeMetric builds a single-valued Gauge. Gauges carry neither aggregation
 // temporality nor a start timestamp.
 func gaugeMetric(name, unit string, now time.Time, points []*metricspb.NumberDataPoint) *metricspb.Metric {

@@ -709,41 +709,57 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 		).WithWidth(w)
 
 	case tabMetricsLogs:
-		return huh.NewForm(
-			huh.NewGroup(
-				huh.NewSelect[string]().
-					Title(settingsLabel("Metric type")).
-					Inline(true).
-					Options(
-						huh.NewOption("Sum", "sum"),
-						huh.NewOption("Gauge", "gauge"),
-						huh.NewOption("Histogram", "histogram"),
-					).
-					Description("Used when metrics are enabled").
-					Value(&m.fMetricType),
-				huh.NewInput().
-					Title(settingsLabel("Metric name")).
-					Inline(true).
-					Placeholder(metricPreview.Name).
-					Value(&m.fMetricName),
-				huh.NewInput().
-					Title(settingsLabel("Metric unit")).
-					Inline(true).
-					Placeholder(metricPreview.Unit).
-					Value(&m.fMetricUnit),
-				huh.NewSelect[string]().
-					Title(settingsLabel("Log severity")).
-					Inline(true).
-					Options(
-						huh.NewOption("DEBUG", "debug"),
-						huh.NewOption("INFO", "info"),
-						huh.NewOption("WARN", "warn"),
-						huh.NewOption("ERROR", "error"),
-					).
-					Description("Used when logs are enabled").
-					Value(&m.fLogSeverity),
-			),
-		).WithWidth(w)
+		metricsNote, _ := inheritedMetricsNote(Service{
+			Name:          strings.TrimSpace(m.fName),
+			InfraTemplate: m.fInfraTemplate,
+			Mesh:          m.fMesh,
+		}, w-4, max(2, m.textLines()-8))
+		metricFields := []huh.Field{
+			huh.NewSelect[string]().
+				Title(settingsLabel("Metric type")).
+				Inline(true).
+				Options(
+					huh.NewOption("Sum", "sum"),
+					huh.NewOption("Gauge", "gauge"),
+					huh.NewOption("Histogram", "histogram"),
+				).
+				Description("Used when metrics are enabled").
+				Value(&m.fMetricType),
+			huh.NewInput().
+				Title(settingsLabel("Metric name")).
+				Inline(true).
+				Placeholder(metricPreview.Name).
+				Value(&m.fMetricName),
+			huh.NewInput().
+				Title(settingsLabel("Metric unit")).
+				Inline(true).
+				Placeholder(metricPreview.Unit).
+				Value(&m.fMetricUnit),
+			huh.NewSelect[string]().
+				Title(settingsLabel("Log severity")).
+				Inline(true).
+				Options(
+					huh.NewOption("DEBUG", "debug"),
+					huh.NewOption("INFO", "info"),
+					huh.NewOption("WARN", "warn"),
+					huh.NewOption("ERROR", "error"),
+				).
+				Description("Used when logs are enabled").
+				Value(&m.fLogSeverity),
+		}
+		// Read-only context goes last, so the editable fields stay at the top
+		// of the tab where the cursor lands.
+		//
+		// On a short terminal it is dropped entirely: the four editable fields
+		// already fill ~16 rows and a huh Note costs several more in chrome
+		// alone, and huh cannot scroll a group that overflows. The tab summary
+		// still shows the count, and ctrl+q still lists every series.
+		if metricsNote != "" && m.textLines() >= 10 {
+			metricFields = append(metricFields, huh.NewNote().
+				Title("Also emitted (read-only)").
+				Description(metricsNote))
+		}
+		return huh.NewForm(huh.NewGroup(metricFields...)).WithWidth(w)
 
 	case tabInfrastructure:
 		// Two-step flow: category first, then the template within that category.
@@ -1269,7 +1285,7 @@ func (m *tui) serviceTabSummaries() []string {
 	metricsLogs := fmt.Sprintf("%s %s · %s logs", metric.Type, metric.Name, strings.ToUpper(effectiveLogSeverity(Service{LogSeverity: m.fLogSeverity})))
 	// The infra template can add system.*/process.* metrics of its own; without
 	// this the extra series are invisible until you open the payload preview.
-	if n := len(infraMetrics(Service{InfraTemplate: m.fInfraTemplate}, time.Now())); n > 0 {
+	if n := len(infraMetricNames(m.fInfraTemplate)); n > 0 {
 		metricsLogs += fmt.Sprintf(" · +%d %s", n, m.fInfraTemplate)
 	}
 	infraTmpl := m.fInfraTemplate
@@ -1635,6 +1651,83 @@ func inheritedResAttrsNote(cfg Config, svc Service, budget int) (string, int) {
 		lines = append(lines, "service.name="+noteEscape(svc.Name)+" (always set)")
 	}
 	return strings.Join(lines, "\n"), len(lines)
+}
+
+// inheritedMetricsNote lists the metrics a service emits in addition to the one
+// configured on this tab: those the infra template contributes for Dynatrace
+// entity extraction, and the Istio mesh series. Both are otherwise invisible
+// until something fails to show up in Grail.
+//
+// Returns ("", 0) when the service emits nothing beyond its configured metric.
+func inheritedMetricsNote(svc Service, budget, maxLines int) (string, int) {
+	var lines []string
+
+	if names := infraMetricNames(svc.InfraTemplate); len(names) > 0 {
+		lines = append(lines, namesBlock(svc.InfraTemplate+" — creates "+entityKindsFor(svc.InfraTemplate), names, budget)...)
+	}
+	if svc.Mesh {
+		lines = append(lines, namesBlock("istio mesh", istioMetricNames, budget)...)
+	}
+	if len(lines) == 0 {
+		return "", 0
+	}
+	// huh cannot scroll a group that overflows its terminal, so trim rather
+	// than push the fields off screen. The marker gets a line of its own:
+	// appending it to the last content line makes that line re-wrap, which
+	// costs back the very row the trim was meant to save.
+	if maxLines > 0 && len(lines) > maxLines {
+		keep := maxLines - 1
+		if keep < 1 {
+			keep = 1
+		}
+		hidden := len(lines) - keep
+		lines = append(lines[:keep], fmt.Sprintf("  … +%d more (ctrl+q)", hidden))
+	}
+	return strings.Join(lines, "\n"), len(lines)
+}
+
+// entityKindsFor names the Dynatrace entities an infra template's metrics
+// create, so the note explains why the extra series are there.
+func entityKindsFor(template string) string {
+	switch template {
+	case "otel-host":
+		return "otel:host"
+	case "otel-host-process":
+		return "otel:host + otel:process"
+	}
+	return "entities"
+}
+
+// namesBlock renders a labelled, width-wrapped list of metric names, matching
+// how attrsBlock lays out inherited attributes.
+func namesBlock(label string, names []string, lineWidth int) []string {
+	header := fmt.Sprintf("%s (%d)", noteEscape(label), len(names))
+	if len(names) == 0 {
+		return []string{header}
+	}
+	width := lineWidth - 2 // 2-char indent on wrapped lines
+	if width < 20 {
+		width = 20
+	}
+	var out, cur []string
+	used := 0
+	for _, n := range names {
+		item := noteEscape(n)
+		add := len(item)
+		if len(cur) > 0 {
+			add += 2
+		}
+		if len(cur) > 0 && used+add > width {
+			out = append(out, "  "+strings.Join(cur, "  "))
+			cur, used, add = nil, 0, len(item)
+		}
+		cur = append(cur, item)
+		used += add
+	}
+	if len(cur) > 0 {
+		out = append(out, "  "+strings.Join(cur, "  "))
+	}
+	return append([]string{header}, out...)
 }
 
 // inheritedSpanAttrsNote returns a multi-line description of the span
