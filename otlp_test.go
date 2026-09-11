@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"strings"
 	"testing"
 
@@ -131,6 +133,115 @@ func TestK8sInfraTemplatesCarryDynatraceAttributes(t *testing.T) {
 			}
 			if kind := attrs["k8s.workload.kind"].Str; kind != "Deployment" {
 				t.Errorf("k8s.workload.kind = %q, want Deployment", kind)
+			}
+		})
+	}
+}
+
+// md5hex returns the MD5 hex digest of s — mirrors hostID in otlp.go.
+func md5hex(s string) string {
+	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// TestOtelInfraTemplatesCarryEntityIdentityAttributes verifies that each OTel
+// infra template includes the resource attributes Dynatrace requires to extract
+// OTEL_HOST and OTEL_PROCESS Smartscape entities.
+func TestOtelInfraTemplatesCarryEntityIdentityAttributes(t *testing.T) {
+	hostRequired := []string{"host.id", "host.name", "telemetry.sdk.name"}
+	processRequired := append(hostRequired, "process.executable.name")
+
+	cases := []struct {
+		template string
+		required []string
+	}{
+		{"otel-host", hostRequired},
+		{"otel-host-process", processRequired},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.template, func(t *testing.T) {
+			attrs := infraDefaults(Service{Name: "my-svc", InfraTemplate: tc.template})
+			for _, key := range tc.required {
+				v, ok := attrs[key]
+				if !ok {
+					t.Errorf("missing %s", key)
+					continue
+				}
+				if v.Type != "string" || v.Str == "" {
+					t.Errorf("%s should be a non-empty string, got %+v", key, v)
+				}
+			}
+			// host.id must be MD5 of host.name
+			wantID := md5hex(attrs["host.name"].Str)
+			if got := attrs["host.id"].Str; got != wantID {
+				t.Errorf("host.id = %q, want MD5(%q) = %q", got, attrs["host.name"].Str, wantID)
+			}
+			if _, hasProc := attrs["process.executable.name"]; hasProc {
+				if attrs["process.executable.name"].Str != "my-svc" {
+					t.Errorf("process.executable.name = %q, want my-svc", attrs["process.executable.name"].Str)
+				}
+			}
+		})
+	}
+}
+
+// TestHostCategoryTemplatesHaveHostID verifies that all five host-category
+// templates now carry host.id (a 32-char MD5 of host.name).
+func TestHostCategoryTemplatesHaveHostID(t *testing.T) {
+	for _, tmpl := range []string{"host", "process", "otel-host", "otel-host-process"} {
+		t.Run(tmpl, func(t *testing.T) {
+			attrs := infraDefaults(Service{Name: "svc", InfraTemplate: tmpl})
+			hn, ok := attrs["host.name"]
+			if !ok {
+				t.Fatal("missing host.name")
+			}
+			id, ok := attrs["host.id"]
+			if !ok {
+				t.Fatal("missing host.id")
+			}
+			if want := md5hex(hn.Str); id.Str != want {
+				t.Errorf("host.id = %q, want MD5(%q) = %q", id.Str, hn.Str, want)
+			}
+		})
+	}
+}
+
+// TestCustomHostAndProcessName verifies that HostName and ProcessName struct
+// fields propagate correctly through infraDefaults.
+func TestCustomHostAndProcessName(t *testing.T) {
+	processTemplates := []string{"process", "otel-host-process"}
+	hostTemplates := []string{"host", "otel-host"}
+
+	for _, tmpl := range append(hostTemplates, processTemplates...) {
+		t.Run(tmpl+"/custom-host", func(t *testing.T) {
+			svc := Service{Name: "svc", InfraTemplate: tmpl, HostName: "my-custom-host"}
+			attrs := infraDefaults(svc)
+			if got := attrs["host.name"].Str; got != "my-custom-host" {
+				t.Errorf("host.name = %q, want my-custom-host", got)
+			}
+			if want := md5hex("my-custom-host"); attrs["host.id"].Str != want {
+				t.Errorf("host.id = %q, want MD5(my-custom-host) = %q", attrs["host.id"].Str, want)
+			}
+		})
+	}
+
+	for _, tmpl := range processTemplates {
+		t.Run(tmpl+"/custom-process", func(t *testing.T) {
+			svc := Service{Name: "svc", InfraTemplate: tmpl, ProcessName: "my-proc"}
+			attrs := infraDefaults(svc)
+			if got := attrs["process.executable.name"].Str; got != "my-proc" {
+				t.Errorf("process.executable.name = %q, want my-proc", got)
+			}
+			if got := attrs["process.command_line"].Str; !strings.Contains(got, "my-proc") {
+				t.Errorf("process.command_line = %q, want to contain my-proc", got)
+			}
+		})
+		t.Run(tmpl+"/default-process-falls-back-to-service-name", func(t *testing.T) {
+			svc := Service{Name: "svc", InfraTemplate: tmpl}
+			attrs := infraDefaults(svc)
+			if got := attrs["process.executable.name"].Str; got != "svc" {
+				t.Errorf("process.executable.name = %q, want svc", got)
 			}
 		})
 	}

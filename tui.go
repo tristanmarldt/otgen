@@ -80,7 +80,9 @@ type tui struct {
 	fTemplate      string
 	fInfraCategory string // "" | "kubernetes" | "container" | "serverless" | "host" | "other"
 	fInfraTemplate string
-	fInfraStep     int // 0 = category select, 1 = template select
+	fInfraStep     int // 0 = category select, 1 = template select, 2 = host/process name
+	fHostName      string
+	fProcessName   string
 	fSpanKind      string
 	fFailure       string
 	fInterval      string
@@ -227,11 +229,18 @@ func (m *tui) updateForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 // leaveForm handles Esc / abort out of an open form.
 func (m *tui) leaveForm() (tea.Model, tea.Cmd) {
 	if m.screen == screenServiceEdit {
-		// Infra step 1 (template): ESC walks back to step 0 (category).
-		if m.editTab == tabInfrastructure && m.fInfraStep == 1 {
-			m.fInfraStep = 0
-			m.form = m.makeServiceTabForm(tabInfrastructure)
-			return m, m.form.Init()
+		if m.editTab == tabInfrastructure {
+			// ESC walks back through infra steps: 2→1→0→tab selector.
+			if m.fInfraStep == 2 {
+				m.fInfraStep = 1
+				m.form = m.makeServiceTabForm(tabInfrastructure)
+				return m, m.form.Init()
+			}
+			if m.fInfraStep == 1 {
+				m.fInfraStep = 0
+				m.form = m.makeServiceTabForm(tabInfrastructure)
+				return m, m.form.Init()
+			}
 		}
 		m.fInfraStep = 0
 		m.tabActive = true
@@ -245,22 +254,28 @@ func (m *tui) leaveForm() (tea.Model, tea.Cmd) {
 func (m *tui) commitForm() (tea.Model, tea.Cmd) {
 	switch m.screen {
 	case screenServiceEdit:
-		// Infrastructure tab is a two-step flow: category → template.
-		if m.editTab == tabInfrastructure && m.fInfraStep == 0 {
-			if m.fInfraCategory == "" {
-				// "None" chosen — no template step needed; clear and return.
-				m.fInfraTemplate = ""
-				m.fInfraStep = 0
-				m.tabActive = true
-				m.form = nil
-				return m, nil
+		// Infrastructure tab is a multi-step flow: category → template → name(s).
+		if m.editTab == tabInfrastructure {
+			if m.fInfraStep == 0 {
+				if m.fInfraCategory == "" {
+					// "None" chosen — clear template and return.
+					m.fInfraTemplate = ""
+					m.fInfraStep = 0
+					m.tabActive = true
+					m.form = nil
+					return m, nil
+				}
+				m.fInfraStep = 1
+				m.form = m.makeServiceTabForm(tabInfrastructure)
+				return m, m.form.Init()
 			}
-			// Advance to template selection.
-			m.fInfraStep = 1
-			m.form = m.makeServiceTabForm(tabInfrastructure)
-			return m, m.form.Init()
+			if m.fInfraStep == 1 && infraNeedsNameStep(m.fInfraTemplate) {
+				m.fInfraStep = 2
+				m.form = m.makeServiceTabForm(tabInfrastructure)
+				return m, m.form.Init()
+			}
 		}
-		// All other tabs (and infra step 1): return to selector.
+		// All other tabs (and infra steps 1 without name step, or step 2): return to selector.
 		m.fInfraStep = 0
 		m.tabActive = true
 		m.form = nil
@@ -367,6 +382,8 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fTemplate = ""
 		m.fInfraCategory = ""
 		m.fInfraTemplate = ""
+		m.fHostName = ""
+		m.fProcessName = ""
 		m.fSpanKind = "server"
 		m.fFailure = "5"
 		m.fInterval = "5"
@@ -387,6 +404,8 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fTemplate = svc.Template
 		m.fInfraCategory = infraCategoryOf[svc.InfraTemplate]
 		m.fInfraTemplate = svc.InfraTemplate
+		m.fHostName = svc.HostName
+		m.fProcessName = svc.ProcessName
 		m.fSpanKind = svc.SpanKind
 		m.fFailure = strconv.Itoa(svc.FailureRate)
 		m.fInterval = strconv.Itoa(svc.Interval)
@@ -445,6 +464,8 @@ func (m *tui) buildServiceFromFields() Service {
 		Name:            strings.TrimSpace(m.fName),
 		Template:        m.fTemplate,
 		InfraTemplate:   m.fInfraTemplate,
+		HostName:        strings.TrimSpace(m.fHostName),
+		ProcessName:     strings.TrimSpace(m.fProcessName),
 		SpanKind:        m.fSpanKind,
 		FailureRate:     failRate,
 		Interval:        interval,
@@ -481,6 +502,7 @@ var infraCategoryOf = map[string]string{
 	"ecs": "container", "azure-container-apps": "container",
 	"lambda": "serverless", "azure-functions": "serverless", "gcp-functions": "serverless",
 	"host": "host", "process": "host",
+	"otel-host": "host", "otel-host-process": "host",
 	"nomad": "other", "cloudfoundry": "other",
 }
 
@@ -514,6 +536,8 @@ func infraTemplatesForCategory(cat string) []huh.Option[string] {
 		return []huh.Option[string]{
 			huh.NewOption("VM / bare metal", "host"),
 			huh.NewOption("Process", "process"),
+			huh.NewOption("OTel host", "otel-host"),
+			huh.NewOption("OTel host + process", "otel-host-process"),
 		}
 	case "other":
 		return []huh.Option[string]{
@@ -522,6 +546,39 @@ func infraTemplatesForCategory(cat string) []huh.Option[string] {
 		}
 	default: // "" = None
 		return []huh.Option[string]{huh.NewOption("—", "")}
+	}
+}
+
+// infraNeedsNameStep returns true for the five host-category templates that
+// prompt for a custom host name (and optionally process name) in step 2.
+func infraNeedsNameStep(template string) bool {
+	switch template {
+	case "host", "process", "otel-host", "otel-host-process":
+		return true
+	}
+	return false
+}
+
+// infraNeedsProcessName returns true for the three templates that also collect
+// a custom process.executable.name.
+func infraNeedsProcessName(template string) bool {
+	switch template {
+	case "process", "otel-host-process":
+		return true
+	}
+	return false
+}
+
+// infraHostNameDefault returns the placeholder / fallback host.name for each
+// host-category template, mirroring effectiveHostName in otlp.go.
+func infraHostNameDefault(template string) string {
+	switch template {
+	case "host":
+		return "prod-server-01"
+	case "process":
+		return "localhost"
+	default:
+		return "otel-host-01"
 	}
 }
 
@@ -711,21 +768,41 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 				),
 			).WithWidth(w)
 		}
-		// step 1 — template within the chosen category
-		return huh.NewForm(
-			huh.NewGroup(
-				huh.NewSelect[string]().
-					Title("Infrastructure — template").
-					Description("Specific environment variant · / to filter · esc back to category").
-					Options(infraTemplatesForCategory(m.fInfraCategory)...).
-					Value(&m.fInfraTemplate),
-			),
-		).WithWidth(w)
+		if m.fInfraStep == 1 {
+			// step 1 — template within the chosen category
+			return huh.NewForm(
+				huh.NewGroup(
+					huh.NewSelect[string]().
+						Title("Infrastructure — template").
+						Description("Specific environment variant · / to filter · esc back to category").
+						Options(infraTemplatesForCategory(m.fInfraCategory)...).
+						Value(&m.fInfraTemplate),
+				),
+			).WithWidth(w)
+		}
+		// step 2 — host name (and optionally process name)
+		nameFields := []huh.Field{
+			huh.NewInput().
+				Title(settingsLabel("Host name")).
+				Description("host.name · leave blank for default · esc back to template").
+				Placeholder(infraHostNameDefault(m.fInfraTemplate)).
+				Value(&m.fHostName),
+		}
+		if infraNeedsProcessName(m.fInfraTemplate) {
+			nameFields = append(nameFields, huh.NewInput().
+				Title(settingsLabel("Process name")).
+				Description("process.executable.name · leave blank to use service name").
+				Placeholder(strings.TrimSpace(m.fName)).
+				Value(&m.fProcessName))
+		}
+		return huh.NewForm(huh.NewGroup(nameFields...)).WithWidth(w)
 
 	case tabResourceAttrs:
 		svcForNote := Service{
 			Name:          strings.TrimSpace(m.fName),
 			InfraTemplate: m.fInfraTemplate,
+			HostName:      strings.TrimSpace(m.fHostName),
+			ProcessName:   strings.TrimSpace(m.fProcessName),
 			Mesh:          m.fMesh,
 		}
 		resNote, resNoteLines := inheritedResAttrsNote(m.cfg, svcForNote, w-4)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/hex"
 	mathrand "math/rand/v2"
@@ -167,6 +168,53 @@ func mergeAttrs(base, extra map[string]AttrValue) map[string]AttrValue {
 	return base
 }
 
+// hostID returns the MD5 hex digest of name, giving a stable 32-char host.id.
+func hostID(name string) string {
+	sum := md5.Sum([]byte(name))
+	return hex.EncodeToString(sum[:])
+}
+
+// effectiveHostName returns the user-supplied HostName when set, otherwise the
+// per-template placeholder for host-category infra templates.
+func effectiveHostName(svc Service) string {
+	if svc.HostName != "" {
+		return svc.HostName
+	}
+	switch svc.InfraTemplate {
+	case "host":
+		return "prod-server-01"
+	case "process":
+		return "localhost"
+	default:
+		return "otel-host-01"
+	}
+}
+
+// effectiveProcessName returns the user-supplied ProcessName when set, otherwise
+// svc.Name (the existing default for process.executable.name).
+func effectiveProcessName(svc Service) string {
+	if svc.ProcessName != "" {
+		return svc.ProcessName
+	}
+	return svc.Name
+}
+
+func otelHostAttrs(hostName string) map[string]AttrValue {
+	return map[string]AttrValue{
+		"host.id":             strAttrVal(hostID(hostName)),
+		"host.name":           strAttrVal(hostName),
+		"host.arch":           strAttrVal("amd64"),
+		"host.ip":             strAttrVal("192.168.1.100"),
+		"host.cpu.model.name": strAttrVal("Intel(R) Xeon(R) CPU @ 2.20GHz"),
+		"os.type":             strAttrVal("linux"),
+		"os.name":             strAttrVal("Ubuntu"),
+		"os.version":          strAttrVal("22.04"),
+		"os.description":      strAttrVal("Ubuntu 22.04.3 LTS"),
+		"os.build.id":         strAttrVal("22.04"),
+		"telemetry.sdk.name":  strAttrVal("opentelemetry"),
+	}
+}
+
 // infraDefaults returns resource attributes for the service's InfraTemplate.
 // Values are deterministic so resource attributes stay stable across ticks.
 // Users override specific values via svc.Attributes.
@@ -215,9 +263,10 @@ func infraDefaults(svc Service) map[string]AttrValue {
 		}
 
 	case "host":
+		hn := effectiveHostName(svc)
 		return map[string]AttrValue{
-			"host.name":  strAttrVal("prod-server-01"),
-			"host.id":    strAttrVal("i-0abcdef1234567890"),
+			"host.name":  strAttrVal(hn),
+			"host.id":    strAttrVal(hostID(hn)),
 			"host.type":  strAttrVal("m5.large"),
 			"host.arch":  strAttrVal("amd64"),
 			"os.type":    strAttrVal("linux"),
@@ -254,13 +303,29 @@ func infraDefaults(svc Service) map[string]AttrValue {
 		}
 
 	case "process":
+		hn := effectiveHostName(svc)
+		pn := effectiveProcessName(svc)
 		return map[string]AttrValue{
 			"process.pid":             intAttrVal(12345),
-			"process.executable.name": strAttrVal(name),
+			"process.executable.name": strAttrVal(pn),
+			"process.command_line":    strAttrVal("/usr/bin/" + pn + " --config=/etc/" + pn + ".yaml"),
 			"process.runtime.name":    strAttrVal("go"),
 			"process.runtime.version": strAttrVal("1.24.0"),
-			"host.name":               strAttrVal("localhost"),
+			"host.name":               strAttrVal(hn),
+			"host.id":                 strAttrVal(hostID(hn)),
 		}
+
+	case "otel-host":
+		return otelHostAttrs(effectiveHostName(svc))
+
+	case "otel-host-process":
+		hn := effectiveHostName(svc)
+		pn := effectiveProcessName(svc)
+		return mergeAttrs(otelHostAttrs(hn), map[string]AttrValue{
+			"process.executable.name": strAttrVal(pn),
+			"process.pid":             intAttrVal(12345),
+			"process.command_line":    strAttrVal("/usr/bin/" + pn + " --config=/etc/" + pn + ".yaml"),
+		})
 
 	case "openshift":
 		return mergeAttrs(k8sAttrs(name, "my-ocp-cluster", "ocp-worker-1"), map[string]AttrValue{
