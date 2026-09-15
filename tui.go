@@ -2065,17 +2065,12 @@ func (m *tui) renderService(svc Service, expanded bool) string {
 		}
 	}
 	var metaTokens []metaToken
-	metaTokens = append(metaTokens, metaToken{svc.SpanKind, sMuted.Render(svc.SpanKind)})
 	if svc.Template != "" {
 		metaTokens = append(metaTokens, bracket(svc.Template))
 	}
 	if svc.InfraTemplate != "" {
 		metaTokens = append(metaTokens, bracket(svc.InfraTemplate))
 	}
-	ivStr := fmt.Sprintf("%d", svc.Interval)
-	metaTokens = append(metaTokens, metaToken{ivStr + "s", sText.Render(ivStr) + sMuted.Render("s")})
-	frStr := fmt.Sprintf("%d%%", svc.FailureRate)
-	metaTokens = append(metaTokens, metaToken{frStr + " err", sText.Render(frStr) + sMuted.Render(" err")})
 	if svc.ChildSpans > 0 {
 		csStr := fmt.Sprintf("+%d", svc.ChildSpans)
 		metaTokens = append(metaTokens, metaToken{csStr + " local child", sText.Render(csStr) + sMuted.Render(" local child")})
