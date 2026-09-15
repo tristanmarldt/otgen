@@ -244,8 +244,31 @@ func marshalTrace(trace *generatedTrace) ([]byte, error) {
 }
 
 func metricsExportRequest(cfg Config, svc Service, now time.Time) (*collectormetricspb.ExportMetricsServiceRequest, error) {
-	effective := effectiveMetricConfig(svc)
 	failed := mathrand.IntN(100) < svc.FailureRate
+	metrics := make([]*metricspb.Metric, 0, len(svc.Metrics)+1)
+	for _, effective := range effectiveMetricConfigs(svc) {
+		metric, err := syntheticMetric(effective, now)
+		if err != nil {
+			return nil, err
+		}
+		metrics = append(metrics, metric)
+	}
+	if svc.Mesh {
+		metrics = append(metrics, istioMetrics(svc, now, failed)...)
+	}
+	// Infra templates that map to Dynatrace entities must also emit a metric
+	// whose key matches system.* / process.*; the extension routes on the key.
+	metrics = append(metrics, infraMetrics(svc, now)...)
+	return &collectormetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
+		Resource: &resourcepb.Resource{Attributes: svcAttributes(cfg, svc)},
+		ScopeMetrics: []*metricspb.ScopeMetrics{{
+			Scope:   &commonpb.InstrumentationScope{Name: "otgen", Version: "1.0.0"},
+			Metrics: metrics,
+		}},
+	}}}, nil
+}
+
+func syntheticMetric(effective MetricConfig, now time.Time) (*metricspb.Metric, error) {
 	metric := &metricspb.Metric{Name: effective.Name, Unit: effective.Unit}
 	switch effective.Type {
 	case "sum":
@@ -287,20 +310,7 @@ func metricsExportRequest(cfg Config, svc Service, now time.Time) (*collectormet
 	default:
 		return nil, fmt.Errorf("unsupported metric type: %s", effective.Type)
 	}
-	metrics := []*metricspb.Metric{metric}
-	if svc.Mesh {
-		metrics = append(metrics, istioMetrics(svc, now, failed)...)
-	}
-	// Infra templates that map to Dynatrace entities must also emit a metric
-	// whose key matches system.* / process.*; the extension routes on the key.
-	metrics = append(metrics, infraMetrics(svc, now)...)
-	return &collectormetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
-		Resource: &resourcepb.Resource{Attributes: svcAttributes(cfg, svc)},
-		ScopeMetrics: []*metricspb.ScopeMetrics{{
-			Scope:   &commonpb.InstrumentationScope{Name: "otgen", Version: "1.0.0"},
-			Metrics: metrics,
-		}},
-	}}}, nil
+	return metric, nil
 }
 
 func marshalMetrics(cfg Config, svc Service, now time.Time) ([]byte, error) {
@@ -332,6 +342,7 @@ func logsExportRequest(cfg Config, trace *generatedTrace, svc Service, now time.
 				event = "otgen.service.failed"
 				outcome = "failure"
 			}
+			body = effectiveLogMessage(generated.Service, body)
 			groups[name] = append(groups[name], &logspb.LogRecord{
 				TimeUnixNano:         generated.Span.EndTimeUnixNano,
 				ObservedTimeUnixNano: uint64(now.UnixNano()),
@@ -362,7 +373,7 @@ func logsExportRequest(cfg Config, trace *generatedTrace, svc Service, now time.
 			ObservedTimeUnixNano: uint64(now.UnixNano()),
 			SeverityNumber:       severity,
 			SeverityText:         text,
-			Body:                 &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: svc.Name + " synthetic log"}},
+			Body:                 &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: effectiveLogMessage(svc, svc.Name+" synthetic log")}},
 		}}}},
 	}}}, nil
 }

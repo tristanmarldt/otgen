@@ -104,8 +104,10 @@ type Service struct {
 	ProcessName     string               `json:"processName,omitempty"`   // custom process.executable.name for process infra templates
 	Mesh            bool                 `json:"mesh,omitempty"`
 	DownstreamCalls []string             `json:"downstreamCalls,omitempty"`
-	Metric          *MetricConfig        `json:"metric,omitempty"`
+	Metrics         []MetricConfig       `json:"metrics,omitempty"`
+	Metric          *MetricConfig        `json:"metric,omitempty"` // legacy: normalized into Metrics
 	LogSeverity     string               `json:"logSeverity,omitempty"`
+	LogMessage      string               `json:"logMessage,omitempty"`
 	Enabled         bool                 `json:"enabled"`
 }
 
@@ -241,12 +243,24 @@ func normalizeService(svc Service) Service {
 	for i := range svc.DownstreamCalls {
 		svc.DownstreamCalls[i] = strings.TrimSpace(svc.DownstreamCalls[i])
 	}
-	if svc.Metric != nil {
-		metric := *svc.Metric
-		metric.Type = strings.ToLower(strings.TrimSpace(metric.Type))
-		svc.Metric = &metric
+	metrics := append([]MetricConfig(nil), svc.Metrics...)
+	if len(metrics) == 0 && svc.Metric != nil {
+		metrics = append(metrics, *svc.Metric)
 	}
+	for i := range metrics {
+		metrics[i].Type = strings.ToLower(strings.TrimSpace(metrics[i].Type))
+		metrics[i].Name = strings.TrimSpace(metrics[i].Name)
+		metrics[i].Unit = strings.TrimSpace(metrics[i].Unit)
+	}
+	// A single empty/sum definition is the historical default. Keep omitting it
+	// so old configurations remain compact and service renames update its name.
+	if len(metrics) == 1 && (metrics[0].Type == "" || metrics[0].Type == "sum") && metrics[0].Name == "" && metrics[0].Unit == "" {
+		metrics = nil
+	}
+	svc.Metrics = metrics
+	svc.Metric = nil
 	svc.LogSeverity = strings.ToLower(strings.TrimSpace(svc.LogSeverity))
+	svc.LogMessage = strings.TrimSpace(svc.LogMessage)
 	svc.HostName = strings.TrimSpace(svc.HostName)
 	svc.ProcessName = strings.TrimSpace(svc.ProcessName)
 	// Only host-category templates read these. Without clearing them, switching
@@ -297,12 +311,22 @@ func validateConfig(cfg Config) error {
 				return fmt.Errorf("services[%d].signals[%d]: must be one of: spans, metrics, logs", i, j)
 			}
 		}
-		if svc.Metric != nil && svc.Metric.Type != "" {
-			switch svc.Metric.Type {
+		for j, metric := range svc.Metrics {
+			if metric.Type == "" {
+				continue
+			}
+			switch metric.Type {
 			case "sum", "gauge", "histogram":
 			default:
-				return fmt.Errorf("services[%d].metric.type: must be one of: sum, gauge, histogram", i)
+				return fmt.Errorf("services[%d].metrics[%d].type: must be one of: sum, gauge, histogram", i, j)
 			}
+		}
+		metricNames := make(map[string]struct{}, len(svc.Metrics))
+		for j, metric := range effectiveMetricConfigs(svc) {
+			if _, duplicate := metricNames[metric.Name]; duplicate {
+				return fmt.Errorf("services[%d].metrics[%d].name: duplicate metric name %q", i, j, metric.Name)
+			}
+			metricNames[metric.Name] = struct{}{}
 		}
 		if svc.LogSeverity != "" {
 			switch svc.LogSeverity {
@@ -406,22 +430,33 @@ func serviceCallCycle(cfg Config) []string {
 	return nil
 }
 
-func effectiveMetricConfig(svc Service) MetricConfig {
-	var cfg MetricConfig
-	if svc.Metric != nil {
-		cfg = *svc.Metric
+func effectiveMetricConfigs(svc Service) []MetricConfig {
+	configured := append([]MetricConfig(nil), svc.Metrics...)
+	if len(configured) == 0 && svc.Metric != nil {
+		configured = append(configured, *svc.Metric)
 	}
+	if len(configured) == 0 {
+		configured = []MetricConfig{{}}
+	}
+	result := make([]MetricConfig, len(configured))
+	for i, cfg := range configured {
+		result[i] = effectiveMetricConfigForService(svc.Name, cfg)
+	}
+	return result
+}
+
+func effectiveMetricConfigForService(serviceName string, cfg MetricConfig) MetricConfig {
 	if cfg.Type == "" {
 		cfg.Type = "sum"
 	}
 	if cfg.Name == "" {
 		switch cfg.Type {
 		case "gauge":
-			cfg.Name = svc.Name + ".load"
+			cfg.Name = serviceName + ".load"
 		case "histogram":
-			cfg.Name = svc.Name + ".request.duration"
+			cfg.Name = serviceName + ".request.duration"
 		default:
-			cfg.Name = svc.Name + ".requests.total"
+			cfg.Name = serviceName + ".requests.total"
 		}
 	}
 	if cfg.Unit == "" {
@@ -434,11 +469,24 @@ func effectiveMetricConfig(svc Service) MetricConfig {
 	return cfg
 }
 
+// effectiveMetricConfig preserves the old single-metric helper for callers
+// that only need the first/default definition.
+func effectiveMetricConfig(svc Service) MetricConfig {
+	return effectiveMetricConfigs(svc)[0]
+}
+
 func effectiveLogSeverity(svc Service) string {
 	if svc.LogSeverity == "" {
 		return "info"
 	}
 	return svc.LogSeverity
+}
+
+func effectiveLogMessage(svc Service, fallback string) string {
+	if svc.LogMessage == "" {
+		return fallback
+	}
+	return svc.LogMessage
 }
 
 // LoadConfig reads and applies config.json, normalizing and validating the result.

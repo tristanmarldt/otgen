@@ -16,15 +16,24 @@ import (
 // svcAttributes builds the resource attribute list for a service.
 // Precedence (high → low): service.name > svc.Attributes > infraDefaults > cfg.Attributes (global).
 func svcAttributes(cfg Config, svc Service) []*commonpb.KeyValue {
-	merged := make(map[string]AttrValue, len(cfg.Attributes)+len(svc.Attributes)+8)
+	merged := inheritedResourceAttrs(cfg, svc)
+	mergeAttrs(merged, svc.Attributes)
+	merged["service.name"] = strAttrVal(svc.Name)
+	return toOTLPAttributes(merged)
+}
+
+// inheritedResourceAttrs is the editable baseline supplied by global config,
+// the infrastructure template, and optional mesh semantics. Service-specific
+// attributes are deliberately excluded so the editor can store only changes.
+func inheritedResourceAttrs(cfg Config, svc Service) map[string]AttrValue {
+	merged := make(map[string]AttrValue, len(cfg.Attributes)+8)
 	mergeAttrs(merged, cfg.Attributes)
 	mergeAttrs(merged, infraDefaults(svc))
 	if svc.Mesh {
 		mergeAttrs(merged, istioResourceAttrs(svc))
 	}
-	mergeAttrs(merged, svc.Attributes)
-	merged["service.name"] = strAttrVal(svc.Name)
-	return toOTLPAttributes(merged)
+	delete(merged, "service.name")
+	return merged
 }
 
 func istioResourceAttrs(svc Service) map[string]AttrValue {
@@ -481,42 +490,88 @@ var (
 	}
 )
 
-// templateDefaults returns the editable/overridable attribute defaults for a
-// given template. These values are used to seed the span-attrs editor and as
-// fallback when SpanAttrs is empty.
+// templateDefaults returns a deterministic example containing every attribute
+// a template generates. Runtime values may vary; the editor uses this stable
+// sample as the baseline for deciding which values the user changed.
 func templateDefaults(template string) map[string]AttrValue {
 	switch template {
 	case "http-server":
 		return map[string]AttrValue{
-			"server.address":           strAttrVal("my-service.internal"),
-			"url.scheme":               strAttrVal("https"),
-			"network.protocol.version": strAttrVal("1.1"),
+			"http.request.method":       strAttrVal("GET"),
+			"url.path":                  strAttrVal("/api/users"),
+			"server.address":            strAttrVal("my-service.internal"),
+			"url.scheme":                strAttrVal("https"),
+			"http.response.status_code": intAttrVal(200),
+			"network.protocol.version":  strAttrVal("1.1"),
 		}
 	case "http-client":
 		return map[string]AttrValue{
-			"server.address":           strAttrVal("api.example.com"),
-			"server.port":              intAttrVal(443),
-			"network.protocol.version": strAttrVal("1.1"),
+			"http.request.method":       strAttrVal("GET"),
+			"server.address":            strAttrVal("api.example.com"),
+			"server.port":               intAttrVal(443),
+			"url.full":                  strAttrVal("https://api.example.com/api/users"),
+			"http.response.status_code": intAttrVal(200),
+			"network.protocol.version":  strAttrVal("1.1"),
 		}
 	case "db":
 		return map[string]AttrValue{
-			"db.system.name": strAttrVal("postgresql"),
-			"db.namespace":   strAttrVal("mydb"),
-			"server.address": strAttrVal("db.internal"),
-			"server.port":    intAttrVal(5432),
+			"db.system.name":     strAttrVal("postgresql"),
+			"db.namespace":       strAttrVal("orders"),
+			"db.operation.name":  strAttrVal("SELECT"),
+			"db.collection.name": strAttrVal("users"),
+			"server.address":     strAttrVal("db.internal"),
+			"server.port":        intAttrVal(5432),
 		}
 	case "messaging":
 		return map[string]AttrValue{
 			"messaging.system":           strAttrVal("kafka"),
-			"messaging.destination.name": strAttrVal("my-topic"),
+			"messaging.destination.name": strAttrVal("orders"),
+			"messaging.operation.name":   strAttrVal("publish"),
+			"messaging.message.id":       strAttrVal("0123456789abcdef"),
+			"messaging.client_id":        strAttrVal("my-service-client"),
 		}
 	case "grpc":
 		return map[string]AttrValue{
-			"rpc.service": strAttrVal("MyService"),
-			"rpc.method":  strAttrVal("MyMethod"),
+			"rpc.system":           strAttrVal("grpc"),
+			"rpc.service":          strAttrVal("UserService"),
+			"rpc.method":           strAttrVal("GetUser"),
+			"rpc.grpc.status_code": intAttrVal(0),
 		}
 	}
 	return nil
+}
+
+// inheritedSpanAttrs makes the deterministic template sample service-aware and
+// includes mesh attributes, all of which applySpanAttrOverrides can replace.
+func inheritedSpanAttrs(svc Service) map[string]AttrValue {
+	attrs := templateDefaults(svc.Template)
+	if attrs == nil {
+		attrs = make(map[string]AttrValue)
+	}
+	switch svc.Template {
+	case "http-server":
+		attrs["server.address"] = strAttrVal(svc.Name + ".service")
+	case "messaging":
+		attrs["messaging.client_id"] = strAttrVal(svc.Name + "-client")
+	}
+	if svc.Mesh {
+		for _, attr := range istioSpanAttrs(svc) {
+			if attr == nil || attr.Value == nil {
+				continue
+			}
+			switch value := attr.Value.Value.(type) {
+			case *commonpb.AnyValue_StringValue:
+				attrs[attr.Key] = strAttrVal(value.StringValue)
+			case *commonpb.AnyValue_BoolValue:
+				attrs[attr.Key] = boolAttrVal(value.BoolValue)
+			case *commonpb.AnyValue_IntValue:
+				attrs[attr.Key] = intAttrVal(value.IntValue)
+			case *commonpb.AnyValue_DoubleValue:
+				attrs[attr.Key] = doubleAttrVal(value.DoubleValue)
+			}
+		}
+	}
+	return attrs
 }
 
 // templateInfo returns the span name and extra semantic-convention attributes

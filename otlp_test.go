@@ -302,6 +302,51 @@ func TestTemplateSpanAttributes(t *testing.T) {
 	}
 }
 
+func TestGeneratedSpanAttributesCanBeOverridden(t *testing.T) {
+	svc := Service{
+		Name:     "checkout",
+		Template: "http-server",
+		SpanKind: "server",
+		SpanAttrs: map[string]AttrValue{
+			"http.request.method":       strAttrVal("OPTIONS"),
+			"http.response.status_code": intAttrVal(418),
+		},
+	}
+	start := time.Now()
+	span := newSpan(svc, make([]byte, 16), make([]byte, 8), start, start.Add(time.Millisecond), false)
+	if got := stringAttrValue(span.Attributes, "http.request.method"); got != "OPTIONS" {
+		t.Fatalf("method override = %q, want OPTIONS", got)
+	}
+	foundStatus := false
+	for _, attr := range span.Attributes {
+		if attr.Key == "http.response.status_code" && attr.Value.GetIntValue() != 418 {
+			t.Fatalf("status override = %d, want 418", attr.Value.GetIntValue())
+		}
+		if attr.Key == "http.response.status_code" {
+			foundStatus = true
+		}
+	}
+	if !foundStatus {
+		t.Fatal("status override attribute is missing")
+	}
+}
+
+func TestSpanEditorBaselineContainsEveryGeneratedTemplateAttribute(t *testing.T) {
+	for _, template := range []string{"http-server", "http-client", "db", "messaging", "grpc"} {
+		t.Run(template, func(t *testing.T) {
+			svc := Service{Name: "checkout", Template: template, SpanKind: "server", Mesh: true}
+			_, generated := templateInfo(svc, false)
+			generated = append(generated, istioSpanAttrs(svc)...)
+			baseline := inheritedSpanAttrs(svc)
+			for _, attr := range generated {
+				if _, visible := baseline[attr.Key]; !visible {
+					t.Errorf("generated attribute %q is missing from editor baseline", attr.Key)
+				}
+			}
+		})
+	}
+}
+
 func TestIstioSemanticsAddWorkloadContext(t *testing.T) {
 	payload := payloadFor(t, Config{}, Service{Name: "checkout", Mesh: true}, signalSpans)
 	var req collectortracepb.ExportTraceServiceRequest
@@ -564,5 +609,33 @@ func TestNameOverridesClearedForUnrelatedTemplates(t *testing.T) {
 	})
 	if svc.HostName != "web-01" || svc.ProcessName != "java" {
 		t.Errorf("otel-host-process dropped names: %+v", svc)
+	}
+}
+
+func TestServiceResourceAttributesOverrideInheritedValues(t *testing.T) {
+	cfg := Config{Attributes: map[string]AttrValue{
+		"deployment.environment.name": strAttrVal("staging"),
+	}}
+	svc := Service{
+		Name:          "checkout",
+		InfraTemplate: "k8s",
+		Attributes: map[string]AttrValue{
+			"deployment.environment.name": strAttrVal("production"),
+			"k8s.cluster.name":            strAttrVal("checkout-prod"),
+			"service.name":                strAttrVal("must-not-win"),
+		},
+	}
+	attrs := svcAttributes(cfg, svc)
+	if got := stringAttrValue(attrs, "deployment.environment.name"); got != "production" {
+		t.Fatalf("global override = %q, want production", got)
+	}
+	if got := stringAttrValue(attrs, "k8s.cluster.name"); got != "checkout-prod" {
+		t.Fatalf("template override = %q, want checkout-prod", got)
+	}
+	if got := stringAttrValue(attrs, "service.name"); got != "checkout" {
+		t.Fatalf("service.name = %q, want checkout", got)
+	}
+	if got := stringAttrValue(attrs, "k8s.namespace.name"); got == "" {
+		t.Fatal("unchanged template attributes disappeared")
 	}
 }
