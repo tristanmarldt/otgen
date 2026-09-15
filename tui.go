@@ -553,7 +553,7 @@ func (m *tui) loadServiceFields(idx int) {
 	m.editorError = ""
 	if idx == -1 {
 		m.fName = defaultServiceNamePrefix
-		m.fTemplate = ""
+		m.fTemplate = "http-server"
 		m.fInfraCategory = ""
 		m.fInfraTemplate = ""
 		m.fHostName = ""
@@ -565,13 +565,12 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fSignals = []string{"logs", "metrics", "spans"}
 		m.fDownstream = nil
 		m.fSignalStep = 0
-		defMetric := effectiveMetricConfig(Service{Name: strings.TrimSpace(m.fName)})
-		m.fMetricPreset = presetForMetric(defMetric.Type, defMetric.Name, defMetric.Unit)
-		m.fMetricType = defMetric.Type
-		m.fMetricName = defMetric.Name
-		m.fMetricUnit = defMetric.Unit
+		m.fMetricPreset = "HTTP request"
+		m.fMetricType = "histogram"
+		m.fMetricName = "http.server.request.duration"
+		m.fMetricUnit = "s"
 		m.fLogSeverity = "info"
-		m.fLogMessage = m.fName + " synthetic log"
+		m.fLogMessage = "HTTP request processed"
 		m.fLogMessageDefault = m.fLogMessage
 		m.fMesh = false
 		m.fEnabled = true
