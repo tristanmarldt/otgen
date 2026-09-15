@@ -2075,9 +2075,9 @@ func (m *tui) renderService(svc Service, expanded bool) string {
 	// Second line: live counters, or a clear disabled/idle marker.
 	switch {
 	case !svc.Enabled:
-		lines = append(lines, "    "+sMuted.Render("disabled — press space to enable"))
+		lines = append(lines, "    "+sText.Render("disabled — press ")+sHelpKey.Render("space")+sText.Render(" to enable"))
 	case !m.status.Running:
-		lines = append(lines, "    "+sMuted.Render("idle — press r to start sending"))
+		lines = append(lines, "    "+sText.Render("idle — press ")+sHelpKey.Render("r")+sText.Render(" to start sending"))
 	default:
 		ss := m.status.Services[svc.Name]
 		var parts []string
