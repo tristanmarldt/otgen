@@ -5,15 +5,15 @@ A lightweight synthetic OTLP data generator with a terminal UI.
 Run it, point it at an endpoint, watch spans · metrics · logs flow. Useful for testing Dynatrace ingest pipelines, validating dashboards, or load-testing collectors without needing a real application.
 
 ```
-  otgen v0.6.0  ● running
+  otgen v0.6.1  ● running
   https://xxx.live.dynatrace.com/api/v2/otlp
   ────────────────────────────────────────────────────────────────────────
 
-▶ ● checkout-svc  server  [http-server]  [k8s]  5s  5% err  +3 local child
+▶ ● checkout-svc  [http-server]  [k8s]  +3 local child
     spans↑142  metrics↑142  logs↑142
-  ● payment-svc  client  [grpc]  [eks]  5s  10% err
+  ● payment-svc  [grpc]  [eks]
     spans↑139  metrics↑139  logs↑139
-  ○ flaky-worker  consumer  [messaging]  2s  80% err
+  ○ flaky-worker  [messaging]
     disabled — press space to enable
 
   n add  ·  ↵ edit  ·  d delete  ·  ␣ toggle  ·  r run/stop  ·  g global  ·  p preview  ·  ? help  ·  q quit
