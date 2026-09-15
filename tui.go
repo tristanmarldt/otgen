@@ -770,7 +770,7 @@ func defaultLogExample(serviceName string) string {
 	if name == "" || name == defaultServiceNamePrefix {
 		name = "otgen-service"
 	}
-	return "INFO | " + name + " synthetic log"
+	return name + " synthetic log"
 }
 
 func (m *tui) hasDownstreamChoices() bool {
@@ -1002,7 +1002,7 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 			}
 			signalFields = append(signalFields, huh.NewText().
 				Title("Metrics").
-				Description("one per line: type | name | unit · blank uses the example shown").
+				Description("gauge · sum · histogram | name | unit  ·  one per line").
 				Placeholder(defaultMetricExample(m.fName)).
 				Lines(metricLines).
 				Value(&m.fMetrics))
@@ -2060,8 +2060,8 @@ func (m *tui) renderHeader() string {
 	return line1 + "\n" + line2 + "\n  " + m.sepLine()
 }
 
-// renderService draws one service. The cursored row is expanded with its
-// effective resource and span attributes; the others stay compact.
+// renderService draws one service row: name + meta on the first line,
+// live counters (or idle/disabled hint) on the second.
 func (m *tui) renderService(svc Service, expanded bool) string {
 	cursor := "  "
 	style := colorForService(svc.Name)
@@ -2125,44 +2125,7 @@ func (m *tui) renderService(svc Service, expanded bool) string {
 		lines = append(lines, line)
 	}
 
-	if !expanded {
-		return strings.Join(lines, "\n")
-	}
-
-	// Expanded: show the attributes that will actually be emitted.
-	resAttrs := inheritedResourceAttrs(m.cfg, svc)
-	mergeAttrs(resAttrs, svc.Attributes)
-	resMark := "✎"
-	if len(svc.Attributes) == 0 {
-		resMark = "~"
-	}
-	lines = append(lines, m.attrLine("res ", resMark, resAttrs))
-
-	spanAttrs := inheritedSpanAttrs(svc)
-	mergeAttrs(spanAttrs, svc.SpanAttrs)
-	spanMark := "✎"
-	if len(svc.SpanAttrs) == 0 {
-		spanMark = "~"
-	}
-	lines = append(lines, m.attrLine("span", spanMark, spanAttrs))
-
 	return strings.Join(lines, "\n")
-}
-
-// attrLine renders one "res"/"span" preview row, fitted to the terminal width.
-func (m *tui) attrLine(label, mark string, attrs map[string]AttrValue) string {
-	if len(attrs) == 0 {
-		return "    " + sMuted.Render(label+"  "+sMuted.Render("—"))
-	}
-	budget := m.width - 14
-	if budget < 20 {
-		budget = 20
-	}
-	preview, shown := attrsPreview(attrs, budget)
-	if rest := len(attrs) - shown; rest > 0 {
-		preview += fmt.Sprintf("  +%d", rest)
-	}
-	return "    " + sMuted.Render(label+" "+mark+" "+preview)
 }
 
 // renderHint formats a single help entry: the key letter(s) in accent bold,
@@ -2219,27 +2182,6 @@ func (m *tui) formWidth() int {
 
 // ── attribute text helpers ────────────────────────────────────────────────────
 
-// attrsPreview returns as many "key=value" pairs as fit in budget columns,
-// along with how many were shown.
-func attrsPreview(attrs map[string]AttrValue, budget int) (string, int) {
-	keys := make([]string, 0, len(attrs))
-	for k := range attrs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var parts []string
-	used := 0
-	for _, k := range keys {
-		pair := k + "=" + attrValueText(attrs[k], false)
-		if used > 0 && used+len(pair)+2 > budget {
-			break
-		}
-		used += len(pair) + 2
-		parts = append(parts, pair)
-	}
-	return strings.Join(parts, "  "), len(parts)
-}
 
 // attrValueText renders an AttrValue. When quote is true, strings that would
 // be re-parsed as another type are wrapped in "" so they round-trip.
