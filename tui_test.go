@@ -369,11 +369,11 @@ func TestListActionsRemainDirectShortcuts(t *testing.T) {
 
 func TestStandardListFooterKeepsDirectActionsVisible(t *testing.T) {
 	m := testTUI(t)
-	m.width = 80
+	m.width = 120 // wide enough for the full single-line hint set
 	footer := stripANSI(m.renderHelp())
-	for _, want := range []string{"space", "toggle", "d delete", "p preview"} {
+	for _, want := range []string{"␣ toggle", "d delete", "p preview"} {
 		if !strings.Contains(footer, want) {
-			t.Fatalf("80-column footer hides %q:\n%s", want, footer)
+			t.Fatalf("120-column footer hides %q:\n%s", want, footer)
 		}
 	}
 }

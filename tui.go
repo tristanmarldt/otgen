@@ -2176,41 +2176,20 @@ func renderHint(hint string) string {
 }
 
 func (m *tui) renderHelp() string {
-	line := func(label string, hints ...string) string {
-		parts := make([]string, len(hints))
-		for i, hint := range hints {
-			parts[i] = renderHint(hint)
+	sep := sHelp.Render("  ·  ")
+	for _, set := range [][]string{
+		{"n add", "↵ edit", "d delete", "␣ toggle", "r run/stop", "t test", "g global", "p preview", "? help", "q quit"},
+		{"n add", "↵ edit", "r run/stop", "g global", "? help", "q quit"},
+		{"↵ edit", "r run", "? help", "q quit"},
+	} {
+		parts := make([]string, len(set))
+		for i, h := range set {
+			parts[i] = renderHint(h)
 		}
-		prefix := "  "
-		if label != "" {
-			prefix += sMuted.Render(fmt.Sprintf("%-10s", label))
+		l := "  " + strings.Join(parts, sep)
+		if lipgloss.Width(l) <= m.width {
+			return l
 		}
-		return prefix + strings.Join(parts, sHelp.Render("  ·  "))
-	}
-
-	grouped := []string{
-		line("service", "n add", "↵ edit", "space toggle", "d delete", "p preview"),
-		line("run/setup", "r run/stop", "g global", "t test", "? help", "q quit"),
-	}
-	if lipgloss.Width(grouped[0]) <= m.width && lipgloss.Width(grouped[1]) <= m.width {
-		return strings.Join(grouped, "\n")
-	}
-
-	compact := []string{
-		line("", "↵ edit", "space toggle", "d delete"),
-		line("", "n add", "p preview", "r run", "? help", "q quit"),
-	}
-	if lipgloss.Width(compact[0]) <= m.width && lipgloss.Width(compact[1]) <= m.width {
-		return strings.Join(compact, "\n")
-	}
-
-	narrow := []string{
-		line("", "↵ edit", "space toggle", "d delete"),
-		line("", "n add", "p preview", "r run"),
-		line("", "g global", "? help", "q quit"),
-	}
-	if lipgloss.Width(narrow[0]) <= m.width && lipgloss.Width(narrow[1]) <= m.width && lipgloss.Width(narrow[2]) <= m.width {
-		return strings.Join(narrow, "\n")
 	}
 	return renderHint("? help")
 }
