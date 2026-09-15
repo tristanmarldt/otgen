@@ -109,6 +109,7 @@ type tui struct {
 	fMetrics        string // complete editable metric rows
 	fMetricsDefault string // non-empty while fMetrics is the generated default row
 	fLog            string // "severity | message"; blank keeps generated INFO default
+	fLogDefault     string // non-empty while fLog is the generated default
 	fMesh           bool
 	fEnabled        bool
 	fAttrs          string
@@ -536,7 +537,8 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fDownstream = nil
 		m.fMetrics = defaultMetricExample(m.fName)
 		m.fMetricsDefault = m.fMetrics
-		m.fLog = ""
+		m.fLog = defaultLogExample(m.fName)
+		m.fLogDefault = m.fLog
 		m.fMesh = false
 		m.fEnabled = true
 		m.fAttrs = ""
@@ -567,6 +569,11 @@ func (m *tui) loadServiceFields(idx int) {
 			m.fMetricsDefault = m.fMetrics
 		}
 		m.fLog = logToText(svc)
+		m.fLogDefault = ""
+		if svc.LogSeverity == "" && svc.LogMessage == "" {
+			m.fLog = defaultLogExample(svc.Name)
+			m.fLogDefault = m.fLog
+		}
 		m.fMesh = svc.Mesh
 		m.fEnabled = svc.Enabled
 
@@ -594,7 +601,11 @@ func (m *tui) buildServiceFromFields() Service {
 		metricsText = ""
 	}
 	metrics, _ := parseMetricsText(metricsText)
-	severity, logMessage, _ := parseLogText(m.fLog)
+	logText := m.fLog
+	if m.fLogDefault != "" && strings.TrimSpace(logText) == strings.TrimSpace(m.fLogDefault) {
+		logText = ""
+	}
+	severity, logMessage, _ := parseLogText(logText)
 	if severity == "info" {
 		severity = ""
 	}
@@ -2179,7 +2190,7 @@ func (m *tui) renderHelp() string {
 
 	grouped := []string{
 		line("service", "n add", "↵ edit", "space toggle", "d delete", "p preview"),
-		line("run/setup", "r run/stop", "c connection", "t test", "? help", "q quit"),
+		line("run/setup", "r run/stop", "g global", "t test", "? help", "q quit"),
 	}
 	if lipgloss.Width(grouped[0]) <= m.width && lipgloss.Width(grouped[1]) <= m.width {
 		return strings.Join(grouped, "\n")
