@@ -2053,26 +2053,58 @@ func (m *tui) renderService(svc Service, expanded bool) string {
 		dot = sSuccess.Render("●")
 	}
 
-	meta := []string{svc.SpanKind}
+	// Meta tokens: dim the structural labels, accent the values.
+	type metaToken struct {
+		plain  string // for width measurement
+		styled string // ANSI-rendered
+	}
+	bracket := func(inner string) metaToken {
+		return metaToken{
+			plain:  "[" + inner + "]",
+			styled: sMuted.Render("[") + sText.Render(inner) + sMuted.Render("]"),
+		}
+	}
+	var metaTokens []metaToken
+	metaTokens = append(metaTokens, metaToken{svc.SpanKind, sMuted.Render(svc.SpanKind)})
 	if svc.Template != "" {
-		meta = append(meta, "["+svc.Template+"]")
+		metaTokens = append(metaTokens, bracket(svc.Template))
 	}
 	if svc.InfraTemplate != "" {
-		meta = append(meta, "["+svc.InfraTemplate+"]")
+		metaTokens = append(metaTokens, bracket(svc.InfraTemplate))
 	}
-	meta = append(meta, fmt.Sprintf("%ds", svc.Interval), fmt.Sprintf("%d%% err", svc.FailureRate))
+	ivStr := fmt.Sprintf("%d", svc.Interval)
+	metaTokens = append(metaTokens, metaToken{ivStr + "s", sText.Render(ivStr) + sMuted.Render("s")})
+	frStr := fmt.Sprintf("%d%%", svc.FailureRate)
+	metaTokens = append(metaTokens, metaToken{frStr + " err", sText.Render(frStr) + sMuted.Render(" err")})
 	if svc.ChildSpans > 0 {
-		meta = append(meta, fmt.Sprintf("+%d local child", svc.ChildSpans))
+		csStr := fmt.Sprintf("+%d", svc.ChildSpans)
+		metaTokens = append(metaTokens, metaToken{csStr + " local child", sText.Render(csStr) + sMuted.Render(" local child")})
 	}
+
 	prefix := cursor + dot + " " + name + "  "
-	metaText := strings.Join(meta, "  ")
-	metaText = truncate(metaText, max(8, m.width-lipgloss.Width(prefix)))
-	row1 := prefix + sMuted.Render(metaText)
+	budget := max(8, m.width-lipgloss.Width(prefix))
+	var metaParts []string
+	used := 0
+	for _, t := range metaTokens {
+		w := len([]rune(t.plain))
+		if used > 0 {
+			w += 2 // separator
+		}
+		if used+w > budget {
+			break
+		}
+		if used > 0 {
+			metaParts = append(metaParts, sMuted.Render("  "))
+		}
+		metaParts = append(metaParts, t.styled)
+		used += w
+	}
+	row1 := prefix + strings.Join(metaParts, "")
 
 	var lines []string
 	lines = append(lines, row1)
 
-	// Second line: live counters, or a clear disabled/idle marker.
+	// Second line: live counters (dim label, accent count), or disabled/idle call-to-action.
 	switch {
 	case !svc.Enabled:
 		lines = append(lines, "    "+sText.Render("disabled — press ")+sHelpKey.Render("space")+sText.Render(" to enable"))
@@ -2082,19 +2114,19 @@ func (m *tui) renderService(svc Service, expanded bool) string {
 		ss := m.status.Services[svc.Name]
 		var parts []string
 		if svc.hasSignal(signalSpans) {
-			parts = append(parts, fmt.Sprintf("spans↑%d", ss.Spans.SentCount))
+			parts = append(parts, sMuted.Render("spans↑")+sPrimary.Render(fmt.Sprintf("%d", ss.Spans.SentCount)))
 		}
 		if svc.hasSignal(signalMetrics) {
-			parts = append(parts, fmt.Sprintf("metrics↑%d", ss.Metrics.SentCount))
+			parts = append(parts, sMuted.Render("metrics↑")+sPrimary.Render(fmt.Sprintf("%d", ss.Metrics.SentCount)))
 		}
 		if svc.hasSignal(signalLogs) {
-			parts = append(parts, fmt.Sprintf("logs↑%d", ss.Logs.SentCount))
+			parts = append(parts, sMuted.Render("logs↑")+sPrimary.Render(fmt.Sprintf("%d", ss.Logs.SentCount)))
 		}
-		line := "    " + sMuted.Render(strings.Join(parts, "  "))
+		line := "    " + strings.Join(parts, sMuted.Render("  "))
 		for _, s := range []SignalStatus{ss.Spans, ss.Metrics, ss.Logs} {
 			if s.LastError != "" {
 				budget := m.width - lipgloss.Width(line) - 8
-				line += "  " + sError.Render("! "+truncate(s.LastError, max(20, budget)))
+				line += sMuted.Render("  ") + sError.Render("! "+truncate(s.LastError, max(20, budget)))
 				break
 			}
 		}
