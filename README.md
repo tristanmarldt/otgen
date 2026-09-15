@@ -5,28 +5,25 @@ A lightweight synthetic OTLP data generator with a terminal UI.
 Run it, point it at an endpoint, watch spans · metrics · logs flow. Useful for testing Dynatrace ingest pipelines, validating dashboards, or load-testing collectors without needing a real application.
 
 ```
-  otgen v0.2.2  ● running
+  otgen v0.6.0  ● running
   https://xxx.live.dynatrace.com/api/v2/otlp
   ────────────────────────────────────────────────────────────────────────
 
 ▶ ● checkout-svc  server  [http-server]  [k8s]  5s  5% err  +3 local child
     spans↑142  metrics↑142  logs↑142
-    res  ~ k8s.cluster.name=my-cluster  k8s.pod.uid=a1b2c3d4-…  +10
-    span ~ http.request.method=GET  url.scheme=https  +4
   ● payment-svc  client  [grpc]  [eks]  5s  10% err
     spans↑139  metrics↑139  logs↑139
   ○ flaky-worker  consumer  [messaging]  2s  80% err
     disabled — press space to enable
 
-  service    n add · ↵ edit · space toggle · d delete · p preview
-  run/setup  r run/stop · c connection · t test · ? help · q quit
+  n add  ·  ↵ edit  ·  d delete  ·  ␣ toggle  ·  r run/stop  ·  g global  ·  p preview  ·  ? help  ·  q quit
 ```
 
 ## Features
 
 - **Service-centric model** — each service emits independently with its own interval, span kind, failure rate, local child spans, signal selection, mesh options, and attributes
 - **Distributed scenarios** — connect services with downstream calls to generate one shared trace across an acyclic service graph
-- **Configurable signals** — emit multiple independently named sum, gauge, or histogram metrics and choose the generated log message and severity
+- **Signal presets** — pick from HTTP request, DB query, Queue / messaging, or Background worker to fill in metric type, name, unit, and log message in one step; or configure them manually with structured fields
 - **Semantic-convention templates** — HTTP, database, messaging and gRPC spans carry the right OTel attributes so Dynatrace detects the technology
 - **Istio mesh telemetry** — optionally add Istio workload semantics to spans/resources and standard mesh metrics to the Metrics signal
 - **Infrastructure templates** — Kubernetes (incl. EKS / GKE / AKS / OpenShift), ECS, Docker, Lambda, Cloud Foundry and more, matching what the Dynatrace collector's `k8sattributesprocessor` and Operator inject
@@ -88,7 +85,7 @@ directly with `1`–`5`:
 | `1` Basics | Name, interval, failure rate, enabled signals |
 | `2` Environment | Separate infrastructure and Istio controls; infrastructure flows from category to template, then optional identity |
 | `3` Trace scenario | Span template/kind/children, then downstream calls when other services exist |
-| `4` Signal details | Multiple metric definitions and/or one combined log severity/message line, plus metrics added by the environment |
+| `4` Signal details | Pick a signal preset or configure metric type / name / unit and log severity / message with structured fields; shows read-only metrics added by the environment |
 | `5` Advanced | Effective resource and span attributes, payload preview |
 
 The section list summarizes the whole service and flags unsaved changes.
@@ -126,11 +123,8 @@ Downstream calls are additive service relationships. For example:
 {
   "name": "checkout-svc",
   "downstreamCalls": ["payment-svc"],
-  "metrics": [
-    {"type": "histogram", "name": "checkout.request.duration", "unit": "ms"},
-    {"type": "gauge", "name": "checkout.queue.depth", "unit": "1"}
-  ],
-  "logMessage": "checkout request processed",
+  "metrics": [{"type": "histogram", "name": "http.server.request.duration", "unit": "s"}],
+  "logMessage": "HTTP request processed",
   "logSeverity": "info",
   "mesh": true
 }
@@ -146,14 +140,20 @@ inherit protocol semantics from the target template: HTTP templates add HTTP
 client attributes, gRPC adds RPC attributes, and generic targets keep the
 minimal edge attributes.
 
-Signal details starts with a complete default metric row. Enter additional
-metrics one per line as `type | name | unit`. Names and units may be omitted;
-defaults are `<service>.requests.total` (`sum`),
-`<service>.load` (`gauge`), and `<service>.request.duration` (`histogram`).
-Histogram values are delta observations in milliseconds. Logs default to a
-generated message at `INFO`. Enter `WARN | checkout queue is growing` to set
-both log fields together, or enter only a message to keep `INFO`. Failed service
-spans promote lower configured severities to `ERROR`.
+Signal details opens with a preset selector. Four built-in presets fill in the
+metric type, name, unit, and default log message in one step:
+
+| Preset | Metric |
+|--------|--------|
+| HTTP request | `histogram` · `http.server.request.duration` · `s` |
+| DB query | `histogram` · `db.client.operation.duration` · `s` |
+| Queue / messaging | `sum` · `messaging.publish.messages` · `{message}` |
+| Background worker | `histogram` · `background.job.duration` · `s` |
+
+Choosing **Custom** keeps the current values. After confirming a preset the next
+step shows structured fields for metric type, name, and unit, then a separate
+severity selector and message input for logs. New services default to the HTTP
+request preset. Failed service spans promote lower configured severities to `ERROR`.
 
 ## Attributes
 
