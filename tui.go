@@ -565,8 +565,8 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fSignals = []string{"logs", "metrics", "spans"}
 		m.fDownstream = nil
 		m.fSignalStep = 0
-		m.fMetricPreset = ""
 		defMetric := effectiveMetricConfig(Service{Name: strings.TrimSpace(m.fName)})
+		m.fMetricPreset = presetForMetric(defMetric.Type, defMetric.Name, defMetric.Unit)
 		m.fMetricType = defMetric.Type
 		m.fMetricName = defMetric.Name
 		m.fMetricUnit = defMetric.Unit
@@ -596,7 +596,6 @@ func (m *tui) loadServiceFields(idx int) {
 			sort.Strings(m.fSignals)
 		}
 		m.fDownstream = append([]string(nil), svc.DownstreamCalls...)
-		m.fSignalStep = 1 // skip preset for existing services
 		if len(svc.Metrics) > 0 || svc.Metric != nil {
 			effective := effectiveMetricConfigs(svc)
 			m.fMetricType = effective[0].Type
@@ -611,6 +610,8 @@ func (m *tui) loadServiceFields(idx int) {
 			m.fMetricName = defMetric.Name
 			m.fMetricUnit = defMetric.Unit
 		}
+		m.fSignalStep = 0
+		m.fMetricPreset = presetForMetric(m.fMetricType, m.fMetricName, m.fMetricUnit)
 		m.fLogSeverity = effectiveLogSeverity(svc)
 		m.fLogMessage = svc.LogMessage
 		m.fLogMessageDefault = ""
@@ -709,25 +710,32 @@ func (m *tui) hasDownstreamChoices() bool {
 
 func (m *tui) applySignalPreset() {
 	for _, p := range signalPresets {
-		if p.Label == m.fMetricPreset {
-			if p.MetricType != "" {
-				m.fMetricType = p.MetricType
-				m.fMetricName = p.MetricName
-				m.fMetricUnit = p.MetricUnit
-			} else {
-				// Custom: derive a sensible default from the service name
-				defMetric := effectiveMetricConfig(Service{Name: strings.TrimSpace(m.fName)})
-				m.fMetricType = defMetric.Type
-				m.fMetricName = defMetric.Name
-				m.fMetricUnit = defMetric.Unit
-			}
+		if p.Label != m.fMetricPreset {
+			continue
+		}
+		if p.MetricType != "" {
+			m.fMetricType = p.MetricType
+			m.fMetricName = p.MetricName
+			m.fMetricUnit = p.MetricUnit
 			if p.LogMessage != "" {
 				m.fLogMessage = p.LogMessage
 				m.fLogMessageDefault = p.LogMessage
 			}
-			return
+		}
+		// Custom: keep existing field values so prior edits survive.
+		return
+	}
+}
+
+// presetForMetric returns the label of the first preset whose metric values
+// match exactly, or "Custom" if none match.
+func presetForMetric(typ, name, unit string) string {
+	for _, p := range signalPresets {
+		if p.MetricType == typ && p.MetricName == name && p.MetricUnit == unit {
+			return p.Label
 		}
 	}
+	return "Custom"
 }
 
 // ── service editor: forms ─────────────────────────────────────────────────────
@@ -937,7 +945,7 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 
 	case tabMetricsLogs:
 		// Step 0: preset selector for new services only.
-		if m.fSignalStep == 0 && (signalEnabled(m.fSignals, "metrics") || signalEnabled(m.fSignals, "logs")) {
+		if m.fSignalStep == 0 && signalEnabled(m.fSignals, "metrics") {
 			presetOpts := make([]huh.Option[string], len(signalPresets))
 			for i, p := range signalPresets {
 				label := p.Label

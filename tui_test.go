@@ -317,11 +317,10 @@ func TestSignalDetailsPresetShownForNewService(t *testing.T) {
 		t.Fatalf("HTTP request preset: type=%q name=%q", m.fMetricType, m.fMetricName)
 	}
 
-	// Existing service with no explicit metrics: name field is pre-filled from
-	// effectiveMetricConfig so the service emits a metric out of the box.
+	// Existing service also starts at step 0 so the preset can be changed.
 	m.loadServiceFields(0)
-	if m.fSignalStep != 1 {
-		t.Fatalf("existing service fSignalStep = %d, want 1", m.fSignalStep)
+	if m.fSignalStep != 0 {
+		t.Fatalf("existing service fSignalStep = %d, want 0", m.fSignalStep)
 	}
 	if m.fMetricName == "" {
 		t.Fatal("existing service with no saved metrics should have a pre-filled metric name")
@@ -341,7 +340,8 @@ func TestLogSeverityAndMessageAreStructuredFields(t *testing.T) {
 		t.Fatalf("loaded log fields: severity=%q message=%q", m.fLogSeverity, m.fLogMessage)
 	}
 
-	// The form shows separate Log severity and Log message fields.
+	// The form in step 1 shows separate Log severity and Log message fields.
+	m.fSignalStep = 1
 	form := m.makeServiceTabForm(tabSignalDetails)
 	form.Init()
 	view := stripANSI(form.View())
