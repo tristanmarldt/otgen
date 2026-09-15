@@ -566,9 +566,10 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fDownstream = nil
 		m.fSignalStep = 0
 		m.fMetricPreset = ""
-		m.fMetricType = "gauge"
-		m.fMetricName = ""
-		m.fMetricUnit = ""
+		defMetric := effectiveMetricConfig(Service{Name: strings.TrimSpace(m.fName)})
+		m.fMetricType = defMetric.Type
+		m.fMetricName = defMetric.Name
+		m.fMetricUnit = defMetric.Unit
 		m.fLogSeverity = "info"
 		m.fLogMessage = m.fName + " synthetic log"
 		m.fLogMessageDefault = m.fLogMessage
@@ -605,9 +606,10 @@ func (m *tui) loadServiceFields(idx int) {
 			m.fMetricName = effective[0].Name
 			m.fMetricUnit = effective[0].Unit
 		} else {
-			m.fMetricType = "gauge"
-			m.fMetricName = ""
-			m.fMetricUnit = ""
+			defMetric := effectiveMetricConfig(Service{Name: svc.Name})
+			m.fMetricType = defMetric.Type
+			m.fMetricName = defMetric.Name
+			m.fMetricUnit = defMetric.Unit
 		}
 		m.fLogSeverity = effectiveLogSeverity(svc)
 		m.fLogMessage = svc.LogMessage
@@ -712,8 +714,13 @@ func (m *tui) applySignalPreset() {
 				m.fMetricType = p.MetricType
 				m.fMetricName = p.MetricName
 				m.fMetricUnit = p.MetricUnit
+			} else {
+				// Custom: derive a sensible default from the service name
+				defMetric := effectiveMetricConfig(Service{Name: strings.TrimSpace(m.fName)})
+				m.fMetricType = defMetric.Type
+				m.fMetricName = defMetric.Name
+				m.fMetricUnit = defMetric.Unit
 			}
-			// p.Label=="Custom": leave fields at their defaults (user will fill in)
 			if p.LogMessage != "" {
 				m.fLogMessage = p.LogMessage
 				m.fLogMessageDefault = p.LogMessage

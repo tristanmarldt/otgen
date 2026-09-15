@@ -317,13 +317,17 @@ func TestSignalDetailsPresetShownForNewService(t *testing.T) {
 		t.Fatalf("HTTP request preset: type=%q name=%q", m.fMetricType, m.fMetricName)
 	}
 
-	// Existing service with no metrics: fMetricName should be empty → no metrics saved.
+	// Existing service with no explicit metrics: name field is pre-filled from
+	// effectiveMetricConfig so the service emits a metric out of the box.
 	m.loadServiceFields(0)
 	if m.fSignalStep != 1 {
 		t.Fatalf("existing service fSignalStep = %d, want 1", m.fSignalStep)
 	}
-	if svc := m.buildServiceFromFields(); len(svc.Metrics) != 0 {
-		t.Fatalf("service with no configured metrics produced Metrics: %+v", svc.Metrics)
+	if m.fMetricName == "" {
+		t.Fatal("existing service with no saved metrics should have a pre-filled metric name")
+	}
+	if svc := m.buildServiceFromFields(); len(svc.Metrics) != 1 {
+		t.Fatalf("pre-filled metric name should produce one metric, got: %+v", svc.Metrics)
 	}
 }
 
