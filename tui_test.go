@@ -128,8 +128,8 @@ func TestDisabledSignalsHideIrrelevantDetailForms(t *testing.T) {
 	signalForm := m.makeServiceTabForm(tabSignalDetails)
 	signalForm.Init()
 	signalView := stripANSI(signalForm.View())
-	if strings.Contains(signalView, "Metrics") || !strings.Contains(signalView, "SEVERITY | message") {
-		t.Fatalf("signal details do not match enabled signals:\n%s", signalView)
+	if strings.Contains(signalView, "Metric") || !strings.Contains(signalView, "Log") {
+		t.Fatalf("signal details do not match enabled signals (metrics should be absent, log fields present):\n%s", signalView)
 	}
 }
 
@@ -296,46 +296,59 @@ func TestInheritedSpanAttributeCanBeEditedDirectly(t *testing.T) {
 	}
 }
 
-func TestMetricsEditorStartsWithCompleteDefaultExample(t *testing.T) {
+func TestSignalDetailsPresetShownForNewService(t *testing.T) {
 	m := testTUI(t)
-	m.loadServiceFields(0)
-	if want := "sum | svc.requests.total | 1"; m.fMetrics != want {
-		t.Fatalf("default metric row = %q, want %q", m.fMetrics, want)
+	// New service: step 0 (preset selector)
+	m.loadServiceFields(-1)
+	if m.fSignalStep != 0 {
+		t.Fatalf("new service fSignalStep = %d, want 0", m.fSignalStep)
 	}
-
-	m.fName = "checkout"
 	form := m.makeServiceTabForm(tabSignalDetails)
 	form.Init()
 	view := stripANSI(form.View())
-	if !strings.Contains(view, "sum | checkout.requests.total | 1") {
-		t.Fatalf("metrics editor lacks complete first-line example:\n%s", view)
+	if !strings.Contains(view, "Signal preset") {
+		t.Fatalf("new service signal details should show preset selector:\n%s", view)
+	}
+
+	// Apply "HTTP request" preset.
+	m.fMetricPreset = "HTTP request"
+	m.applySignalPreset()
+	if m.fMetricType != "histogram" || m.fMetricName != "http.server.request.duration" {
+		t.Fatalf("HTTP request preset: type=%q name=%q", m.fMetricType, m.fMetricName)
+	}
+
+	// Existing service with no metrics: fMetricName should be empty → no metrics saved.
+	m.loadServiceFields(0)
+	if m.fSignalStep != 1 {
+		t.Fatalf("existing service fSignalStep = %d, want 1", m.fSignalStep)
 	}
 	if svc := m.buildServiceFromFields(); len(svc.Metrics) != 0 {
-		t.Fatalf("untouched generated example was persisted: %+v", svc.Metrics)
-	}
-	metrics, err := parseMetricsText("")
-	if err != nil || len(metrics) != 1 {
-		t.Fatalf("blank example did not resolve to default metric: metrics=%+v err=%v", metrics, err)
+		t.Fatalf("service with no configured metrics produced Metrics: %+v", svc.Metrics)
 	}
 }
 
-func TestLogSeverityAndMessageShareOneField(t *testing.T) {
-	severity, message, err := parseLogText("WARN | checkout queue is growing")
-	if err != nil || severity != "warn" || message != "checkout queue is growing" {
-		t.Fatalf("combined log = severity %q, message %q, err %v", severity, message, err)
-	}
-	severity, message, err = parseLogText("checkout completed")
-	if err != nil || severity != "info" || message != "checkout completed" {
-		t.Fatalf("message-only log = severity %q, message %q, err %v", severity, message, err)
+func TestLogSeverityAndMessageAreStructuredFields(t *testing.T) {
+	// Loading a service with explicit severity/message populates the separate fields.
+	m := testTUI(t)
+	m.cfg.Services[0].LogSeverity = "warn"
+	m.cfg.Services[0].LogMessage = "checkout failed"
+	m.loadServiceFields(0)
+	if m.fLogSeverity != "warn" || m.fLogMessage != "checkout failed" {
+		t.Fatalf("loaded log fields: severity=%q message=%q", m.fLogSeverity, m.fLogMessage)
 	}
 
-	m := testTUI(t)
-	m.loadServiceFields(0)
+	// The form shows separate Log severity and Log message fields.
 	form := m.makeServiceTabForm(tabSignalDetails)
 	form.Init()
 	view := stripANSI(form.View())
-	if !strings.Contains(view, "SEVERITY | message") || strings.Contains(view, "Log severity") || strings.Contains(view, "Log message") {
-		t.Fatalf("log settings are not combined into one field:\n%s", view)
+	if !strings.Contains(view, "Log severity") && !strings.Contains(view, "Log message") {
+		t.Fatalf("signal details form lacks structured log fields:\n%s", view)
+	}
+
+	// Round-trip: buildServiceFromFields persists severity and message.
+	svc := m.buildServiceFromFields()
+	if svc.LogSeverity != "warn" || svc.LogMessage != "checkout failed" {
+		t.Fatalf("round-trip: severity=%q message=%q", svc.LogSeverity, svc.LogMessage)
 	}
 }
 
@@ -537,14 +550,18 @@ func TestCallsMetricsAndLogsRoundTrip(t *testing.T) {
 	m := testTUI(t)
 	m.loadServiceFields(0)
 	m.fDownstream = []string{"payment-svc", "inventory-svc"}
-	m.fMetrics = "histogram | latency | ms\ngauge | queue.depth | 1"
-	m.fLog = "WARN | checkout queue is growing"
+	m.fMetricType = "histogram"
+	m.fMetricName = "latency"
+	m.fMetricUnit = "ms"
+	m.fLogSeverity = "warn"
+	m.fLogMessage = "checkout queue is growing"
+	m.fLogMessageDefault = "" // explicit message, not the generated default
 	svc := m.buildServiceFromFields()
 	if len(svc.DownstreamCalls) != 2 || svc.DownstreamCalls[0] != "payment-svc" {
 		t.Fatalf("downstream calls = %+v", svc.DownstreamCalls)
 	}
-	if len(svc.Metrics) != 2 || svc.Metrics[0].Type != "histogram" || svc.Metrics[0].Name != "latency" || svc.Metrics[1].Name != "queue.depth" {
-		t.Fatalf("metric configs = %+v", svc.Metrics)
+	if len(svc.Metrics) != 1 || svc.Metrics[0].Type != "histogram" || svc.Metrics[0].Name != "latency" || svc.Metrics[0].Unit != "ms" {
+		t.Fatalf("metric config = %+v", svc.Metrics)
 	}
 	if svc.LogSeverity != "warn" || svc.LogMessage != "checkout queue is growing" {
 		t.Fatalf("log config = severity %q, message %q", svc.LogSeverity, svc.LogMessage)

@@ -60,6 +60,24 @@ const (
 
 var serviceTabNames = []string{"Basics", "Environment", "Trace scenario", "Signal details", "Advanced"}
 
+// ── signal presets ────────────────────────────────────────────────────────────
+
+type signalPreset struct {
+	Label      string
+	MetricType string
+	MetricName string
+	MetricUnit string
+	LogMessage string
+}
+
+var signalPresets = []signalPreset{
+	{"HTTP request", "histogram", "http.server.request.duration", "s", "HTTP request processed"},
+	{"DB query", "histogram", "db.client.operation.duration", "s", "DB query completed"},
+	{"Queue / messaging", "sum", "messaging.publish.messages", "{message}", "Message published"},
+	{"Background worker", "histogram", "background.job.duration", "s", "Job completed"},
+	{"Custom", "", "", "", ""},
+}
+
 // ── model ─────────────────────────────────────────────────────────────────────
 
 // tui is the root Bubble Tea model. It uses a pointer receiver throughout so
@@ -106,10 +124,14 @@ type tui struct {
 	fChildSpans     string
 	fSignals        []string
 	fDownstream     []string
-	fMetrics        string // complete editable metric rows
-	fMetricsDefault string // non-empty while fMetrics is the generated default row
-	fLog            string // "severity | message"; blank keeps generated INFO default
-	fLogDefault     string // non-empty while fLog is the generated default
+	fSignalStep        int    // 0 = preset select (new svc), 1 = field editing
+	fMetricPreset      string // label of chosen preset
+	fMetricType        string // "gauge" | "sum" | "histogram"
+	fMetricName        string
+	fMetricUnit        string
+	fLogSeverity       string // "info" | "warn" | "error" | "debug"
+	fLogMessage        string
+	fLogMessageDefault string // non-empty while fLogMessage is the generated default
 	fMesh           bool
 	fEnabled        bool
 	fAttrs          string
@@ -389,6 +411,13 @@ func (m *tui) commitForm() (tea.Model, tea.Cmd) {
 			m.form = nil
 			return m, nil
 		}
+		// Signal Details preset step: apply preset and advance to field editing.
+		if m.editTab == tabMetricsLogs && m.fSignalStep == 0 {
+			m.applySignalPreset()
+			m.fSignalStep = 1
+			m.form = m.makeServiceTabForm(tabMetricsLogs)
+			return m, m.form.Init()
+		}
 		// All other tabs (and infra steps 1 without name step, or step 2): return to selector.
 		m.traceStep = 0
 		m.environmentStep = 0
@@ -535,10 +564,14 @@ func (m *tui) loadServiceFields(idx int) {
 		m.fChildSpans = "0"
 		m.fSignals = []string{"logs", "metrics", "spans"}
 		m.fDownstream = nil
-		m.fMetrics = defaultMetricExample(m.fName)
-		m.fMetricsDefault = m.fMetrics
-		m.fLog = defaultLogExample(m.fName)
-		m.fLogDefault = m.fLog
+		m.fSignalStep = 0
+		m.fMetricPreset = ""
+		m.fMetricType = "gauge"
+		m.fMetricName = ""
+		m.fMetricUnit = ""
+		m.fLogSeverity = "info"
+		m.fLogMessage = m.fName + " synthetic log"
+		m.fLogMessageDefault = m.fLogMessage
 		m.fMesh = false
 		m.fEnabled = true
 		m.fAttrs = ""
@@ -562,17 +595,26 @@ func (m *tui) loadServiceFields(idx int) {
 			sort.Strings(m.fSignals)
 		}
 		m.fDownstream = append([]string(nil), svc.DownstreamCalls...)
-		m.fMetrics = metricsToText(svc)
-		m.fMetricsDefault = ""
-		if len(svc.Metrics) == 0 && svc.Metric == nil {
-			m.fMetrics = defaultMetricExample(svc.Name)
-			m.fMetricsDefault = m.fMetrics
+		m.fSignalStep = 1 // skip preset for existing services
+		if len(svc.Metrics) > 0 || svc.Metric != nil {
+			effective := effectiveMetricConfigs(svc)
+			m.fMetricType = effective[0].Type
+			if m.fMetricType == "" {
+				m.fMetricType = "gauge"
+			}
+			m.fMetricName = effective[0].Name
+			m.fMetricUnit = effective[0].Unit
+		} else {
+			m.fMetricType = "gauge"
+			m.fMetricName = ""
+			m.fMetricUnit = ""
 		}
-		m.fLog = logToText(svc)
-		m.fLogDefault = ""
+		m.fLogSeverity = effectiveLogSeverity(svc)
+		m.fLogMessage = svc.LogMessage
+		m.fLogMessageDefault = ""
 		if svc.LogSeverity == "" && svc.LogMessage == "" {
-			m.fLog = defaultLogExample(svc.Name)
-			m.fLogDefault = m.fLog
+			m.fLogMessage = svc.Name + " synthetic log"
+			m.fLogMessageDefault = m.fLogMessage
 		}
 		m.fMesh = svc.Mesh
 		m.fEnabled = svc.Enabled
@@ -596,18 +638,26 @@ func (m *tui) buildServiceFromFields() Service {
 	if len(signals) == 3 {
 		signals = nil // all three = store empty (= all enabled)
 	}
-	metricsText := m.fMetrics
-	if m.fMetricsDefault != "" && strings.TrimSpace(metricsText) == strings.TrimSpace(m.fMetricsDefault) {
-		metricsText = ""
+
+	// Metrics: single structured metric
+	var metrics []MetricConfig
+	if strings.TrimSpace(m.fMetricName) != "" {
+		metrics = []MetricConfig{{
+			Type: m.fMetricType,
+			Name: strings.TrimSpace(m.fMetricName),
+			Unit: strings.TrimSpace(m.fMetricUnit),
+		}}
 	}
-	metrics, _ := parseMetricsText(metricsText)
-	logText := m.fLog
-	if m.fLogDefault != "" && strings.TrimSpace(logText) == strings.TrimSpace(m.fLogDefault) {
-		logText = ""
+
+	// Log: from structured fields
+	logSeverity := m.fLogSeverity
+	logMessage := strings.TrimSpace(m.fLogMessage)
+	if m.fLogMessageDefault != "" && logMessage == strings.TrimSpace(m.fLogMessageDefault) && logSeverity == "info" {
+		logSeverity = ""
+		logMessage = ""
 	}
-	severity, logMessage, _ := parseLogText(logText)
-	if severity == "info" {
-		severity = ""
+	if logSeverity == "info" {
+		logSeverity = "" // INFO is the default; don't persist it
 	}
 
 	return normalizeService(Service{
@@ -623,7 +673,7 @@ func (m *tui) buildServiceFromFields() Service {
 		Signals:         signals,
 		DownstreamCalls: append([]string(nil), m.fDownstream...),
 		Metrics:         metrics,
-		LogSeverity:     severity,
+		LogSeverity:     logSeverity,
 		LogMessage:      logMessage,
 		Mesh:            m.fMesh,
 		Enabled:         m.fEnabled,
@@ -646,133 +696,6 @@ func signalEnabled(signals []string, want string) bool {
 	return false
 }
 
-func parseMetricsText(text string) ([]MetricConfig, error) {
-	var metrics []MetricConfig
-	lineNumber := 0
-	for _, raw := range strings.Split(text, "\n") {
-		lineNumber++
-		line := strings.TrimSpace(raw)
-		if line == "" {
-			continue
-		}
-		parts := strings.Split(line, "|")
-		if len(parts) == 1 {
-			parts = strings.Fields(line)
-		}
-		if len(parts) > 3 {
-			return nil, fmt.Errorf("metric line %d: use type | name | unit", lineNumber)
-		}
-		for i := range parts {
-			parts[i] = strings.TrimSpace(parts[i])
-		}
-		metric := MetricConfig{}
-		if len(parts) > 0 {
-			metric.Type = strings.ToLower(parts[0])
-		}
-		if len(parts) > 1 {
-			metric.Name = parts[1]
-		}
-		if len(parts) > 2 {
-			metric.Unit = parts[2]
-		}
-		switch metric.Type {
-		case "", "sum", "gauge", "histogram":
-		default:
-			return nil, fmt.Errorf("metric line %d: type must be sum, gauge, or histogram", lineNumber)
-		}
-		metrics = append(metrics, metric)
-	}
-	if len(metrics) == 0 {
-		// A blank editor accepts the complete example shown as its placeholder
-		// and retains the historical service-name-derived sum metric.
-		return []MetricConfig{{}}, nil
-	}
-	return metrics, nil
-}
-
-func metricsToText(svc Service) string {
-	metrics := append([]MetricConfig(nil), svc.Metrics...)
-	if len(metrics) == 0 && svc.Metric != nil {
-		metrics = append(metrics, *svc.Metric)
-	}
-	if len(metrics) == 0 {
-		return ""
-	}
-	lines := make([]string, 0, len(metrics))
-	for _, metric := range metrics {
-		parts := []string{metric.Type, metric.Name, metric.Unit}
-		last := len(parts) - 1
-		for last > 0 && strings.TrimSpace(parts[last]) == "" {
-			last--
-		}
-		lines = append(lines, strings.Join(parts[:last+1], " | "))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func defaultMetricExample(serviceName string) string {
-	name := strings.TrimSpace(serviceName)
-	if name == "" || name == defaultServiceNamePrefix {
-		name = "otgen-service"
-	}
-	metric := effectiveMetricConfig(Service{Name: name})
-	return fmt.Sprintf("%s | %s | %s", metric.Type, metric.Name, metric.Unit)
-}
-
-func (m *tui) refreshDefaultMetricExample() {
-	if m.fMetricsDefault == "" || strings.TrimSpace(m.fMetrics) != strings.TrimSpace(m.fMetricsDefault) {
-		return
-	}
-	m.fMetricsDefault = defaultMetricExample(m.fName)
-	m.fMetrics = m.fMetricsDefault
-}
-
-func parseLogText(text string) (severity, message string, err error) {
-	line := strings.TrimSpace(text)
-	if line == "" {
-		return "info", "", nil
-	}
-	parts := strings.SplitN(line, "|", 2)
-	first := strings.ToLower(strings.TrimSpace(parts[0]))
-	validSeverity := first == "debug" || first == "info" || first == "warn" || first == "error"
-	if len(parts) == 1 {
-		if validSeverity {
-			return first, "", nil
-		}
-		// A message on its own is the fastest common path; INFO is implied.
-		return "info", line, nil
-	}
-	if first == "" {
-		first = "info"
-		validSeverity = true
-	}
-	message = strings.TrimSpace(parts[1])
-	if !validSeverity {
-		return first, message, fmt.Errorf("log severity must be DEBUG, INFO, WARN, or ERROR")
-	}
-	return first, message, nil
-}
-
-func logToText(svc Service) string {
-	severity := effectiveLogSeverity(svc)
-	message := strings.TrimSpace(svc.LogMessage)
-	if severity == "info" && message == "" {
-		return ""
-	}
-	if message == "" {
-		return strings.ToUpper(severity)
-	}
-	return strings.ToUpper(severity) + " | " + message
-}
-
-func defaultLogExample(serviceName string) string {
-	name := strings.TrimSpace(serviceName)
-	if name == "" || name == defaultServiceNamePrefix {
-		name = "otgen-service"
-	}
-	return name + " synthetic log"
-}
-
 func (m *tui) hasDownstreamChoices() bool {
 	for i := range m.cfg.Services {
 		if i != m.editIdx {
@@ -780,6 +703,24 @@ func (m *tui) hasDownstreamChoices() bool {
 		}
 	}
 	return false
+}
+
+func (m *tui) applySignalPreset() {
+	for _, p := range signalPresets {
+		if p.Label == m.fMetricPreset {
+			if p.MetricType != "" {
+				m.fMetricType = p.MetricType
+				m.fMetricName = p.MetricName
+				m.fMetricUnit = p.MetricUnit
+			}
+			// p.Label=="Custom": leave fields at their defaults (user will fill in)
+			if p.LogMessage != "" {
+				m.fLogMessage = p.LogMessage
+				m.fLogMessageDefault = p.LogMessage
+			}
+			return
+		}
+	}
 }
 
 // ── service editor: forms ─────────────────────────────────────────────────────
@@ -988,7 +929,26 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 		).WithWidth(w)
 
 	case tabMetricsLogs:
-		m.refreshDefaultMetricExample()
+		// Step 0: preset selector for new services only.
+		if m.fSignalStep == 0 && (signalEnabled(m.fSignals, "metrics") || signalEnabled(m.fSignals, "logs")) {
+			presetOpts := make([]huh.Option[string], len(signalPresets))
+			for i, p := range signalPresets {
+				label := p.Label
+				if p.MetricType != "" {
+					label = p.Label + " (" + p.MetricType + " · " + p.MetricName + " · " + p.MetricUnit + ")"
+				}
+				presetOpts[i] = huh.NewOption(label, p.Label)
+			}
+			return huh.NewForm(huh.NewGroup(
+				huh.NewSelect[string]().
+					Title("Signal preset").
+					Description("Fill in metric name and unit from a common pattern").
+					Options(presetOpts...).
+					Value(&m.fMetricPreset),
+			)).WithWidth(w)
+		}
+
+		// Step 1: structured fields.
 		metricsNote, _ := inheritedMetricsNote(Service{
 			Name:          strings.TrimSpace(m.fName),
 			InfraTemplate: m.fInfraTemplate,
@@ -996,23 +956,48 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 		}, w-4, max(2, m.textLines()-8))
 		signalFields := []huh.Field{}
 		if signalEnabled(m.fSignals, "metrics") {
-			metricLines := min(7, max(3, m.textLines()-4))
-			if signalEnabled(m.fSignals, "logs") {
-				metricLines = min(metricLines, 4)
-			}
-			signalFields = append(signalFields, huh.NewText().
-				Title("Metrics").
-				Description("gauge · sum · histogram | name | unit  ·  one per line").
-				Placeholder(defaultMetricExample(m.fName)).
-				Lines(metricLines).
-				Value(&m.fMetrics))
+			signalFields = append(signalFields,
+				huh.NewSelect[string]().
+					Title(settingsLabel("Metric type")).
+					Inline(true).
+					Options(
+						huh.NewOption("gauge", "gauge"),
+						huh.NewOption("sum", "sum"),
+						huh.NewOption("histogram", "histogram"),
+					).
+					Description("←/→ change").
+					Value(&m.fMetricType),
+				huh.NewInput().
+					Title(settingsLabel("Metric name")).
+					Inline(true).
+					Placeholder("e.g. http.server.request.duration").
+					Value(&m.fMetricName),
+				huh.NewInput().
+					Title(settingsLabel("Unit")).
+					Inline(true).
+					Placeholder("s, ms, {request}, …").
+					Value(&m.fMetricUnit),
+			)
 		}
 		if signalEnabled(m.fSignals, "logs") {
-			signalFields = append(signalFields, huh.NewInput().
-				Title("Log").
-				Description("SEVERITY | message · or enter only a message for INFO").
-				Placeholder(defaultLogExample(m.fName)).
-				Value(&m.fLog))
+			signalFields = append(signalFields,
+				huh.NewSelect[string]().
+					Title(settingsLabel("Log severity")).
+					Inline(true).
+					Options(
+						huh.NewOption("INFO", "info"),
+						huh.NewOption("WARN", "warn"),
+						huh.NewOption("ERROR", "error"),
+						huh.NewOption("DEBUG", "debug"),
+					).
+					Description("←/→ change").
+					Value(&m.fLogSeverity),
+				huh.NewInput().
+					Title(settingsLabel("Log message")).
+					Inline(true).
+					Placeholder(strings.TrimSpace(m.fName)+" synthetic log").
+					Value(&m.fLogMessage),
+			)
 		}
 		if len(signalFields) == 0 {
 			signalFields = append(signalFields, huh.NewNote().
@@ -1022,10 +1007,10 @@ func (m *tui) makeServiceTabForm(tabIdx int) *huh.Form {
 		// Read-only context goes last, so the editable fields stay at the top
 		// of the tab where the cursor lands.
 		//
-		// On a short terminal it is dropped entirely: the four editable fields
-		// already fill ~16 rows and a huh Note costs several more in chrome
+		// On a short terminal it is dropped entirely: the structured fields
+		// already fill several rows and a huh Note costs several more in chrome
 		// alone, and huh cannot scroll a group that overflows. The tab summary
-		// still shows the count, and the payload preview still lists every series.
+		// still shows the values, and the payload preview still lists every series.
 		if signalEnabled(m.fSignals, "metrics") && metricsNote != "" && m.height >= 30 {
 			signalFields = append(signalFields, huh.NewNote().
 				Title("Also emitted (read-only)").
@@ -1257,24 +1242,6 @@ func (m *tui) validateEditorFields() error {
 	}
 	if len(m.fSignals) == 0 {
 		return fmt.Errorf("select at least one signal")
-	}
-	if signalEnabled(m.fSignals, "metrics") {
-		metrics, err := parseMetricsText(m.fMetrics)
-		if err != nil {
-			return err
-		}
-		seenNames := make(map[string]struct{}, len(metrics))
-		for i, metric := range effectiveMetricConfigs(Service{Name: strings.TrimSpace(m.fName), Metrics: metrics}) {
-			if _, duplicate := seenNames[metric.Name]; duplicate {
-				return fmt.Errorf("metric line %d: duplicate metric name %q", i+1, metric.Name)
-			}
-			seenNames[metric.Name] = struct{}{}
-		}
-	}
-	if signalEnabled(m.fSignals, "logs") {
-		if _, _, err := parseLogText(m.fLog); err != nil {
-			return err
-		}
 	}
 	if m.fInfraCategory != "" && infraCategoryOf[m.fInfraTemplate] != m.fInfraCategory {
 		return fmt.Errorf("choose an infrastructure template for the selected environment")
@@ -1820,29 +1787,24 @@ func (m *tui) serviceTabSummaries() []string {
 
 	var signalParts []string
 	if signalEnabled(m.fSignals, "metrics") {
-		configured, err := parseMetricsText(m.fMetrics)
-		if err != nil {
-			signalParts = append(signalParts, sWarn.Render("metrics need attention"))
-		} else {
-			metrics := effectiveMetricConfigs(Service{Name: strings.TrimSpace(m.fName), Metrics: configured})
-			if len(metrics) == 1 {
-				signalParts = append(signalParts, fmt.Sprintf("%s %s", metrics[0].Type, metrics[0].Name))
-			} else {
-				names := make([]string, 0, len(metrics))
-				for _, metric := range metrics {
-					names = append(names, metric.Name)
-				}
-				signalParts = append(signalParts, fmt.Sprintf("%d metrics: %s", len(metrics), truncate(strings.Join(names, ", "), max(16, m.width-48))))
+		if m.fMetricName != "" {
+			typ := m.fMetricType
+			if typ == "" {
+				typ = "gauge"
 			}
+			signalParts = append(signalParts, typ+" "+m.fMetricName)
+		} else {
+			signalParts = append(signalParts, sMuted.Render("no metric configured"))
 		}
 	}
 	if signalEnabled(m.fSignals, "logs") {
-		severity, message, err := parseLogText(m.fLog)
-		logs := strings.ToUpper(severity) + " logs"
-		if err != nil {
-			logs = sWarn.Render("log needs attention")
-		} else if message != "" {
-			logs += " · " + truncate(message, max(12, m.width-48))
+		sev := strings.ToUpper(m.fLogSeverity)
+		if sev == "" {
+			sev = "INFO"
+		}
+		logs := sev + " logs"
+		if msg := strings.TrimSpace(m.fLogMessage); msg != "" && m.fLogMessageDefault == "" {
+			logs += " · " + truncate(msg, max(12, m.width-48))
 		}
 		signalParts = append(signalParts, logs)
 	}
