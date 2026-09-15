@@ -2207,7 +2207,7 @@ func (m *tui) renderHelp() string {
 	narrow := []string{
 		line("", "↵ edit", "space toggle", "d delete"),
 		line("", "n add", "p preview", "r run"),
-		line("", "c connect", "? help", "q quit"),
+		line("", "g global", "? help", "q quit"),
 	}
 	if lipgloss.Width(narrow[0]) <= m.width && lipgloss.Width(narrow[1]) <= m.width && lipgloss.Width(narrow[2]) <= m.width {
 		return strings.Join(narrow, "\n")
